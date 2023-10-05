@@ -12,14 +12,23 @@ import (
 )
 
 type Config struct {
-	Header       string `json:"header"`
-	CleanupQuery bool   `json:"cleanupQuery"`
+	// Name of the header used to propagate the BasicAuth token.
+	//
+	// The default value is `Authorization`, but `Proxy-Authorization` is a
+	// common alternative.
+	Header string `json:"header"`
+
+	// Compatibility mode, disabled by default.
+	//
+	// When enabled, the SubsonicAuth query parameters are not stripped from the
+	// request, i.e. BasicAuth and SubsonicAuth are both used.
+	Compat bool `json:"compat"`
 }
 
 func CreateConfig() *Config {
 	return &Config{
-		Header:       "Authorization",
-		CleanupQuery: true,
+		Header: "Authorization",
+		Compat: false,
 	}
 }
 
@@ -102,7 +111,15 @@ func (middleware *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Reque
 	var token = base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 	req.Header.Set(middleware.config.Header, "Basic "+token)
 
-	// TODO: Drop u, p, t, s query parameters
+	if !middleware.config.Compat {
+		query.Del("u")
+		query.Del("p")
+		query.Del("t")
+		query.Del("s")
+
+		req.URL.RawQuery = query.Encode()
+		req.RequestURI = req.URL.RequestURI()
+	}
 
 	middleware.next.ServeHTTP(res, req)
 }
