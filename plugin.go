@@ -56,6 +56,9 @@ func (middleware *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Reque
 }
 
 func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
+	var propagateHeader = middleware.config.Header != ""
+	var interceptResponse = middleware.config.Header != ""
+
 	// Caution: query.Get() returns the first parameter's value. We need to
 	// enforce that the query contains at most one of each auth parameter that
 	// we use for authentication, to avoid HTTP Parameter Pollution attacks. It
@@ -72,12 +75,6 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 		res.sendError(&Error{
 			Code:    0,
 			Message: "Invalid query",
-		})
-		return
-	} else {
-		res.sendError(&Error{
-			Code:    10,
-			Message: "Required parameter is missing: u",
 		})
 		return
 	}
@@ -107,15 +104,64 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 			Message: "Token authentication not supported",
 		})
 		return
-	} else {
-		res.sendError(&Error{
-			Code:    40,
-			Message: "Required parameter is missing: p",
-		})
-		return
 	}
 
-	if middleware.config.Header != "" {
+	// Subsonicauth parameters' validation is relaxed to not penalize clients
+	// that support basicauth: those clients can either use only basicauth, in
+	// which case we don't consider the subsonicauth parameters as missing, or
+	// both basicauth and subsonicauth, in which case they must match.
+	if u, p, ok := parseBasicAuth(req, middleware.config.Header); ok {
+		if u == "" || p == "" {
+			// Even if allowed by basicauth, it is assumed that subsonicauth
+			// doesn't allow empty username or password, so we shouldn't allow
+			// it for the adapter either.
+			res.sendError(&Error{
+				Code:    40,
+				Message: "Invalid BasicAuth credentials",
+			})
+			return
+		} else if user == "" && pass == "" {
+			// Client uses basicauth without subsonicauth
+			propagateHeader = false
+		} else if user == "" {
+			res.sendError(&Error{
+				Code:    40,
+				Message: "Required parameter is missing: u",
+			})
+			return
+		} else if pass == "" {
+			res.sendError(&Error{
+				Code:    40,
+				Message: "Required parameter is missing: p",
+			})
+			return
+		} else if u == user && p == pass {
+			// Client uses both basicauth and subsonicauth and they match
+			propagateHeader = false
+		} else {
+			res.sendError(&Error{
+				Code:    0,
+				Message: "BasicAuth and SubsonicAuth credentials don't match",
+			})
+			return
+		}
+	} else {
+		if user == "" {
+			res.sendError(&Error{
+				Code:    40,
+				Message: "Required parameter is missing: u",
+			})
+			return
+		} else if pass == "" {
+			res.sendError(&Error{
+				Code:    40,
+				Message: "Required parameter is missing: p",
+			})
+			return
+		}
+	}
+
+	if propagateHeader {
 		var token = base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 		req.Header.Set(middleware.config.Header, "Basic "+token)
 	}
@@ -130,11 +176,34 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 		req.RequestURI = req.URL.RequestURI()
 	}
 
-	if middleware.config.Header != "" {
+	if interceptResponse {
 		middleware.next.ServeHTTP(&res, req)
 	} else {
 		middleware.next.ServeHTTP(res.ResponseWriter, req)
 	}
+}
+
+// Adapted from net/http/request.go
+func parseBasicAuth(r *http.Request, header string) (username, password string, ok bool) {
+	auth := r.Header.Get(header)
+	if auth == "" {
+		return "", "", false
+	}
+
+	const prefix = "Basic "
+	if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return "", "", false
+	}
+	c, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	if err != nil {
+		return "", "", false
+	}
+	cs := string(c)
+	username, password, ok = strings.Cut(cs, ":")
+	if !ok {
+		return "", "", false
+	}
+	return username, password, true
 }
 
 type responseWriter struct {
