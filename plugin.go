@@ -14,14 +14,19 @@ import (
 type Config struct {
 	// Name of the header used to propagate the BasicAuth token.
 	//
-	// The default value is `Authorization`, but `Proxy-Authorization` is a
+	// The default value is "Authorization", but "Proxy-Authorization" is a
 	// common alternative.
+	//
+	// The sanitization-only mode is enabled by setting an empty value: The
+	// authentication parameters get validated and (depending on the Compat
+	// option) stripped from the query, but without adding a BasicAuth header to
+	// the forwarded request nor rewriting responses.
 	Header string `json:"header"`
 
 	// Compatibility mode, disabled by default.
 	//
 	// When enabled, the SubsonicAuth query parameters are not stripped from the
-	// request, i.e. BasicAuth and SubsonicAuth are both used.
+	// request, i.e. BasicAuth and SubsonicAuth are both forwarded.
 	Compat bool `json:"compat"`
 }
 
@@ -47,8 +52,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 }
 
 func (middleware *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
-	res = SubResponseWriter{ResponseWriter: res, req: req}
+	middleware.serveHTTP(SubResponseWriter{ResponseWriter: res, req: req}, req)
+}
 
+func (middleware *Middleware) serveHTTP(res SubResponseWriter, req *http.Request) {
 	// Caution: query.Get() returns the first parameter's value. We need to
 	// enforce that the query contains at most one of each auth parameter that
 	// we use for authentication, to avoid HTTP Parameter Pollution attacks. It
@@ -62,13 +69,13 @@ func (middleware *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Reque
 	if u := query["u"]; len(u) == 1 {
 		user = u[0]
 	} else if len(u) > 1 {
-		res.(SubResponseWriter).sendError(&Error{
+		res.sendError(&Error{
 			Code:    0,
 			Message: "Invalid query",
 		})
 		return
 	} else {
-		res.(SubResponseWriter).sendError(&Error{
+		res.sendError(&Error{
 			Code:    10,
 			Message: "Required parameter is missing: u",
 		})
@@ -80,7 +87,7 @@ func (middleware *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Reque
 		if strings.HasPrefix(pass, "enc:") {
 			var bytes, err = hex.DecodeString(strings.TrimPrefix(pass, "enc:"))
 			if err != nil {
-				res.(SubResponseWriter).sendError(&Error{
+				res.sendError(&Error{
 					Code:    40,
 					Message: "Wrong username or password",
 				})
@@ -89,27 +96,29 @@ func (middleware *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Reque
 			pass = string(bytes)
 		}
 	} else if len(p) > 1 {
-		res.(SubResponseWriter).sendError(&Error{
+		res.sendError(&Error{
 			Code:    0,
 			Message: "Invalid query",
 		})
 		return
 	} else if len(query["t"]) > 0 && len(query["s"]) > 0 {
-		res.(SubResponseWriter).sendError(&Error{
+		res.sendError(&Error{
 			Code:    41,
 			Message: "Token authentication not supported",
 		})
 		return
 	} else {
-		res.(SubResponseWriter).sendError(&Error{
+		res.sendError(&Error{
 			Code:    40,
 			Message: "Required parameter is missing: p",
 		})
 		return
 	}
 
-	var token = base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
-	req.Header.Set(middleware.config.Header, "Basic "+token)
+	if middleware.config.Header != "" {
+		var token = base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+		req.Header.Set(middleware.config.Header, "Basic "+token)
+	}
 
 	if !middleware.config.Compat {
 		query.Del("u")
@@ -121,7 +130,11 @@ func (middleware *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Reque
 		req.RequestURI = req.URL.RequestURI()
 	}
 
-	middleware.next.ServeHTTP(res, req)
+	if middleware.config.Header != "" {
+		middleware.next.ServeHTTP(res, req)
+	} else {
+		middleware.next.ServeHTTP(res.ResponseWriter, req)
+	}
 }
 
 type SubResponseWriter struct {
