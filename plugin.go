@@ -52,10 +52,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 }
 
 func (middleware *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
-	middleware.serveHTTP(SubResponseWriter{ResponseWriter: res, req: req}, req)
+	middleware.serveHTTP(responseWriter{ResponseWriter: res, req: req}, req)
 }
 
-func (middleware *Middleware) serveHTTP(res SubResponseWriter, req *http.Request) {
+func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 	// Caution: query.Get() returns the first parameter's value. We need to
 	// enforce that the query contains at most one of each auth parameter that
 	// we use for authentication, to avoid HTTP Parameter Pollution attacks. It
@@ -131,21 +131,22 @@ func (middleware *Middleware) serveHTTP(res SubResponseWriter, req *http.Request
 	}
 
 	if middleware.config.Header != "" {
-		middleware.next.ServeHTTP(res, req)
+		middleware.next.ServeHTTP(&res, req)
 	} else {
 		middleware.next.ServeHTTP(res.ResponseWriter, req)
 	}
 }
 
-type SubResponseWriter struct {
+type responseWriter struct {
 	http.ResponseWriter
-	req *http.Request
+	req         *http.Request
+	intercepted bool
 }
 
 // Wraps the original method and intercepts authentication errors, rewriting the
 // response to ensure that clients get an appropriate subsonic error instead of
 // an HTTP one.
-func (res SubResponseWriter) WriteHeader(statusCode int) {
+func (res *responseWriter) WriteHeader(statusCode int) {
 	if statusCode == 401 || statusCode == 403 || statusCode == 407 {
 		res.sendError(&Error{
 			Code:    40,
@@ -157,8 +158,19 @@ func (res SubResponseWriter) WriteHeader(statusCode int) {
 	res.ResponseWriter.WriteHeader(statusCode)
 }
 
+// Wraps the original method and ensures that writes by downstream handlers are
+// ignored if we already sent a subsonic response.
+func (res responseWriter) Write(data []byte) (n int, err error) {
+	if res.intercepted {
+		return 0, nil
+	}
+	return res.ResponseWriter.Write(data)
+}
+
 // Immediately respond with a subsonic error
-func (res SubResponseWriter) sendError(payload *Error) {
+func (res *responseWriter) sendError(payload *Error) {
+	res.intercepted = true
+
 	var response = Subsonic{
 		Version:       "1.16.1",
 		Type:          "proxy-auth",
@@ -189,7 +201,7 @@ func (res SubResponseWriter) sendError(payload *Error) {
 	res.Header().Del("Content-Length")
 	res.Header().Set("Content-Type", mime)
 	res.ResponseWriter.WriteHeader(200)
-	res.Write(body)
+	res.ResponseWriter.Write(body)
 }
 
 type Subsonic struct {
