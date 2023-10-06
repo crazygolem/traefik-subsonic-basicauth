@@ -1,4 +1,4 @@
-package subsonicauth_to_basicauth
+package plugin
 
 import (
 	"context"

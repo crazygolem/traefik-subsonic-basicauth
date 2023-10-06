@@ -1,0 +1,11 @@
+displayName: BasicAuth adapter for Subsonic
+type: middleware
+
+import: github.com/crazygolem/traefik-subsonic-basicauth
+
+summary: >
+  Transforms Subsonic authentication parameters into a BasicAuth header, to be
+  used as an adapter for ForwardAuth or to remove sensitive query parameters
+  for Subsonic servers that handle BasicAuth.
+
+testData: {} # plugin-defined default values are used
