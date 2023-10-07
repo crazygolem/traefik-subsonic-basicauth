@@ -1,12 +1,14 @@
 package plugin
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 )
@@ -229,11 +231,24 @@ func (res *responseWriter) WriteHeader(statusCode int) {
 
 // Wraps the original method and ensures that writes by downstream handlers are
 // ignored if we already sent a subsonic response.
-func (res responseWriter) Write(data []byte) (n int, err error) {
+func (res *responseWriter) Write(data []byte) (n int, err error) {
 	if res.intercepted {
 		return 0, nil
 	}
 	return res.ResponseWriter.Write(data)
+}
+
+func (res *responseWriter) Flush() {
+	if r, ok := res.ResponseWriter.(http.Flusher); ok {
+		r.Flush()
+	}
+}
+
+func (res *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if r, ok := res.ResponseWriter.(http.Hijacker); ok {
+		return r.Hijack()
+	}
+	return nil, nil, fmt.Errorf("%T is not an http.Hijacker", res.ResponseWriter)
 }
 
 // Immediately respond with a subsonic error
