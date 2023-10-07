@@ -74,10 +74,7 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 	if u := query["u"]; len(u) == 1 {
 		user = u[0]
 	} else if len(u) > 1 {
-		res.sendError(&Error{
-			Code:    0,
-			Message: "Invalid query",
-		})
+		res.sendError(0, "Invalid query")
 		return
 	}
 
@@ -86,25 +83,16 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 		if strings.HasPrefix(pass, "enc:") {
 			var bytes, err = hex.DecodeString(strings.TrimPrefix(pass, "enc:"))
 			if err != nil {
-				res.sendError(&Error{
-					Code:    40,
-					Message: "Wrong username or password",
-				})
+				res.sendError(40, "Wrong username or password")
 				return
 			}
 			pass = string(bytes)
 		}
 	} else if len(p) > 1 {
-		res.sendError(&Error{
-			Code:    0,
-			Message: "Invalid query",
-		})
+		res.sendError(0, "Invalid query")
 		return
 	} else if len(query["t"]) > 0 && len(query["s"]) > 0 {
-		res.sendError(&Error{
-			Code:    41,
-			Message: "Token authentication not supported",
-		})
+		res.sendError(41, "Token authentication not supported")
 		return
 	}
 
@@ -117,48 +105,30 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 			// Even if allowed by basicauth, it is assumed that subsonicauth
 			// doesn't allow empty username or password, so we shouldn't allow
 			// it for the adapter either.
-			res.sendError(&Error{
-				Code:    40,
-				Message: "Invalid BasicAuth credentials",
-			})
+			res.sendError(40, "Invalid BasicAuth credentials")
 			return
 		} else if user == "" && pass == "" {
 			// Client uses basicauth without subsonicauth
 			propagateHeader = false
 		} else if user == "" {
-			res.sendError(&Error{
-				Code:    40,
-				Message: "Required parameter is missing: u",
-			})
+			res.sendError(40, "Required parameter is missing: u")
 			return
 		} else if pass == "" {
-			res.sendError(&Error{
-				Code:    40,
-				Message: "Required parameter is missing: p",
-			})
+			res.sendError(40, "Required parameter is missing: p")
 			return
 		} else if u == user && p == pass {
 			// Client uses both basicauth and subsonicauth and they match
 			propagateHeader = false
 		} else {
-			res.sendError(&Error{
-				Code:    0,
-				Message: "BasicAuth and SubsonicAuth credentials don't match",
-			})
+			res.sendError(0, "BasicAuth and SubsonicAuth credentials don't match")
 			return
 		}
 	} else {
 		if user == "" {
-			res.sendError(&Error{
-				Code:    40,
-				Message: "Required parameter is missing: u",
-			})
+			res.sendError(40, "Required parameter is missing: u")
 			return
 		} else if pass == "" {
-			res.sendError(&Error{
-				Code:    40,
-				Message: "Required parameter is missing: p",
-			})
+			res.sendError(40, "Required parameter is missing: p")
 			return
 		}
 	}
@@ -219,10 +189,7 @@ type responseWriter struct {
 // an HTTP one.
 func (res *responseWriter) WriteHeader(statusCode int) {
 	if statusCode == 401 || statusCode == 403 || statusCode == 407 {
-		res.sendError(&Error{
-			Code:    40,
-			Message: "Wrong username or password",
-		})
+		res.sendError(40, "Wrong username or password")
 		return
 	}
 
@@ -252,7 +219,7 @@ func (res *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 // Immediately respond with a subsonic error
-func (res *responseWriter) sendError(payload *Error) {
+func (res *responseWriter) sendError(code int32, message string) {
 	res.intercepted = true
 
 	var response = Subsonic{
@@ -261,7 +228,7 @@ func (res *responseWriter) sendError(payload *Error) {
 		ServerVersion: "n/a",
 		OpenSubsonic:  true,
 		Status:        "failed",
-		Error:         payload,
+		Error:         &Error{Code: code, Message: message},
 	}
 
 	var mime string
