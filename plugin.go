@@ -8,10 +8,15 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 )
+
+var DEBUG = log.New(io.Discard, "DEBUG [subsonic-basicauth]: ", 0)
 
 type Config struct {
 	// Name of the header used to propagate the BasicAuth token.
@@ -30,12 +35,15 @@ type Config struct {
 	// When enabled, the SubsonicAuth query parameters are not stripped from the
 	// request, i.e. BasicAuth and SubsonicAuth are both forwarded.
 	Compat bool `json:"compat"`
+
+	Debug bool `json:"debug"`
 }
 
 func CreateConfig() *Config {
 	return &Config{
 		Header: "Authorization",
 		Compat: false,
+		Debug:  false,
 	}
 }
 
@@ -46,6 +54,12 @@ type Middleware struct {
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+	if config.Debug {
+		DEBUG.SetFlags(log.LstdFlags)
+		DEBUG.SetOutput(os.Stdout)
+	}
+
+	DEBUG.Printf("Plugin instantiated: %s", name)
 	return &Middleware{
 		config: config,
 		name:   name,
@@ -54,6 +68,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 }
 
 func (middleware *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+	DEBUG.Printf("Handling request: %s", req.URL.Path)
 	middleware.serveHTTP(responseWriter{ResponseWriter: res, req: req}, req)
 }
 
@@ -101,6 +116,7 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 	// which case we don't consider the subsonicauth parameters as missing, or
 	// both basicauth and subsonicauth, in which case they must match.
 	if u, p, ok := parseBasicAuth(req, middleware.config.Header); ok {
+		DEBUG.Printf("Header already set from upstream: %s", middleware.config.Header)
 		if u == "" || p == "" {
 			// Even if allowed by basicauth, it is assumed that subsonicauth
 			// doesn't allow empty username or password, so we shouldn't allow
@@ -134,6 +150,7 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 	}
 
 	if propagateHeader {
+		DEBUG.Printf("Propagating header for user: %s", user)
 		var token = base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 		req.Header.Set(middleware.config.Header, "Basic "+token)
 	}
@@ -146,6 +163,7 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 
 		req.URL.RawQuery = query.Encode()
 		req.RequestURI = req.URL.RequestURI()
+		DEBUG.Printf("Subsonicauth query parameters removed: %s", req.RequestURI)
 	}
 
 	if interceptResponse {
@@ -189,6 +207,7 @@ type responseWriter struct {
 // an HTTP one.
 func (res *responseWriter) WriteHeader(statusCode int) {
 	if statusCode == 401 || statusCode == 403 || statusCode == 407 {
+		DEBUG.Printf("Rewriting authentication error response: %d", statusCode)
 		res.sendError(40, "Wrong username or password")
 		return
 	}
