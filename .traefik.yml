@@ -8,4 +8,5 @@ summary: >
   used as an adapter for ForwardAuth or to remove sensitive query parameters
   for Subsonic servers that handle BasicAuth.
 
-testData: {} # plugin-defined default values are used
+testData:
+  auth: proxy
