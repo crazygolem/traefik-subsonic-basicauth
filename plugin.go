@@ -19,30 +19,48 @@ import (
 var DEBUG = log.New(io.Discard, "DEBUG [subsonic-basicauth]: ", 0)
 
 type Config struct {
+	// # Authentication mode
+	//
+	//   * "backend": The subsonic backend is performing the BasicAuth
+	//     authentication.
+	//
+	//     In this mode, the SubsonicAuth parameters are removed, and the
+	//     response is not rewritten: as the backend is a subsonic server, it is
+	//     expected to sent proper subsonic responses in all situations.
+	//
+	//   * "proxy": The proxy is handling the authentication, e.g. using
+	//     ForwardAuth.
+	//
+	//     In this mode, the SubsonicAuth parameters are removed, and the
+	//     response is rewritten in case of authentication error: the proxy and
+	//     the authentication service are not expected to know how to properly
+	//     answer with a subsonic error, so the plugin has to intervene.
+	//
+	//     SECURITY NOTE: If used with a ForwardAuth middleware, make sure to
+	//     remove the BasicAuth header after the authentication and before
+	//     forwarding the request to the backend. Traefik's architecture makes
+	//     it impossible to handle this directly in this plugin.
+	Auth string `json:"auth"`
+
+	// Enable debug logs. Does not contain sensitive data related to the
+	// subsonic authentication.
+	Debug bool `json:"debug"`
+
 	// Name of the header used to propagate the BasicAuth token.
 	//
 	// The default value is "Authorization", but "Proxy-Authorization" is a
 	// common alternative.
 	//
 	// The sanitization-only mode is enabled by setting an empty value: The
-	// authentication parameters get validated and (depending on the Compat
-	// option) stripped from the query, but without adding a BasicAuth header to
-	// the forwarded request nor rewriting responses.
+	// authentication parameters get validated and stripped from the query, but
+	// without adding a BasicAuth header to the forwarded request nor rewriting
+	// responses.
 	Header string `json:"header"`
-
-	// Compatibility mode, disabled by default.
-	//
-	// When enabled, the SubsonicAuth query parameters are not stripped from the
-	// request, i.e. BasicAuth and SubsonicAuth are both forwarded.
-	Compat bool `json:"compat"`
-
-	Debug bool `json:"debug"`
 }
 
 func CreateConfig() *Config {
 	return &Config{
 		Header: "Authorization",
-		Compat: false,
 		Debug:  false,
 	}
 }
@@ -57,6 +75,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	if config.Debug {
 		DEBUG.SetFlags(log.LstdFlags)
 		DEBUG.SetOutput(os.Stdout)
+	}
+
+	switch config.Auth {
+	case "backend", "proxy":
+	default:
+		return nil, fmt.Errorf("invalid 'auth' parameter: %s", config.Auth)
 	}
 
 	DEBUG.Printf("Plugin instantiated: %s", name)
@@ -74,7 +98,7 @@ func (middleware *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Reque
 
 func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 	var propagateHeader = middleware.config.Header != ""
-	var interceptResponse = middleware.config.Header != ""
+	var interceptResponse = middleware.config.Header != "" && middleware.config.Auth == "proxy"
 
 	// Caution: query.Get() returns the first parameter's value. We need to
 	// enforce that the query contains at most one of each auth parameter that
@@ -155,16 +179,14 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 		req.Header.Set(middleware.config.Header, "Basic "+token)
 	}
 
-	if !middleware.config.Compat {
-		query.Del("u")
-		query.Del("p")
-		query.Del("t")
-		query.Del("s")
+	query.Del("u")
+	query.Del("p")
+	query.Del("t")
+	query.Del("s")
 
-		req.URL.RawQuery = query.Encode()
-		req.RequestURI = req.URL.RequestURI()
-		DEBUG.Printf("Subsonicauth query parameters removed: %s", req.RequestURI)
-	}
+	req.URL.RawQuery = query.Encode()
+	req.RequestURI = req.URL.RequestURI()
+	DEBUG.Printf("Subsonicauth query parameters removed: %s", req.RequestURI)
 
 	if interceptResponse {
 		middleware.next.ServeHTTP(&res, req)
@@ -175,24 +197,23 @@ func (middleware *Middleware) serveHTTP(res responseWriter, req *http.Request) {
 
 // Adapted from net/http/request.go
 func parseBasicAuth(r *http.Request, header string) (username, password string, ok bool) {
-	auth := r.Header.Get(header)
-	if auth == "" {
-		return "", "", false
-	}
-
 	const prefix = "Basic "
+	var auth = r.Header.Get(header)
+
 	if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
 		return "", "", false
 	}
-	c, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
-	if err != nil {
+
+	if bytes, err := base64.StdEncoding.DecodeString(auth[len(prefix):]); err != nil {
+		return "", "", false
+	} else {
+		auth = string(bytes)
+	}
+
+	if username, password, ok = strings.Cut(auth, ":"); !ok {
 		return "", "", false
 	}
-	cs := string(c)
-	username, password, ok = strings.Cut(cs, ":")
-	if !ok {
-		return "", "", false
-	}
+
 	return username, password, true
 }
 
