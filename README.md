@@ -11,6 +11,9 @@ In front of a Subsonic server that supports BasicAuth or some other
 authentication scheme, it lets you remove sensitive query parameters to
 reduce the risk of exposing them in logs.
 
+The plugin validates Subsonic authentication parameters for security, and
+removes them before forwarding the request.
+
 # Security warning
 
 This plugin requires clients to use the old subsonic authentication scheme where
@@ -51,3 +54,82 @@ new scheme.
 
 
 [os-api-auth]: https://github.com/opensubsonic/open-subsonic-api/discussions/25
+
+
+# Configuration
+
+**`auth`**
+
+Required, either `backend` or `proxy`.
+
+The plugin supports two deployment scenarios:
+1. Backend authentication, where the subsonic service supports BasicAuth and
+   authenticates requests itself;
+2. Proxy authentication, where a third-party service performs the
+   authentication, e.g. using Traefik's ForwardAuth middleware.
+
+The difference between the two modes is whether the response is intercepted and
+rewritten in case of authentication error: a subsonic authentication error does
+not look the same as an HTTP authentication error, and clients are expecting a
+proper subsonic error when authentication fails, which cannot be expected from
+a generic third-party authentication service.
+
+**`header`**
+
+Optional, defaults to `Authorization`.
+
+Specifies the header that gets propagated with the Basic credentials. An empty
+value disables header propagation and response rewriting. The Subsonic
+authentication parameters still get validated and removed from the forwarded
+request.
+
+**`debug`**
+
+Optional, defaults to `false`.
+
+Controls whether debug logs are produced. Debug logs should not contain
+sensitive data related to subsonic.
+
+## Examples
+
+**Backend authentication**
+
+```yaml
+# On your subsonic service
+labels:
+    traefik.http.routers.subsonic.rule: Host(`subsonic.example.com`) && PathPrefix(`/rest/`)
+    traefik.http.routers.subsonic.middlewares: subsonicauth-sub2basic@docker
+
+    traefik.http.middlewares.subsonicauth-sub2basic.plugin.subsonic-basicauth.auth: backend
+```
+
+**Proxy authentication**
+
+In this scenario, the Subsonic backend still needs to know which user is making
+the request. This will depend on your Subsonic server, and the integration is
+not shown here.
+
+Note that in this scenario you should avoid forwarding the BasicAuth header
+as-is to the Subsonic server, as it shouldn't need to get the user's password.
+
+```yaml
+# On your authentication service
+labels:
+    # Your BasicAuth service, e.g. a BasicAuth or ForwardAuth middleware
+    traefik.http.middlewares.authservice-basicauth.[...]
+
+    # The subsonicauth middleware that should be mapped on your routes
+    traefik.http.middlewares.authservice-subsonicauth.chain.middlewares: subsonicauth-sub2basic@docker,authservice-basicauth@docker,subsonicauth-cleanup@docker
+
+    # Supporting middlewares
+    traefik.http.middlewares.subsonicauth-sub2basic.plugin.subsonic-basicauth.auth: proxy
+    traefik.http.middlewares.subsonicauth-sub2basic.plugin.subsonic-basicauth.header: Authorization
+    traefik.http.middlewares.subsonicauth-cleanup.headers.customrequestheaders.Authorization: # empty removes the header
+```
+
+```yaml
+# On your subsonic service
+labels:
+    traefik.http.routers.subsonic.rule: Host(`subsonic.example.com`) && PathPrefix(`/rest/`)
+    traefik.http.routers.subsonic.middlewares: authservice-subsonicauth@docker
+```
