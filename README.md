@@ -83,6 +83,18 @@ value disables header propagation and response rewriting. The Subsonic
 authentication parameters still get validated and removed from the forwarded
 request.
 
+**`client-headers`**
+
+Optional, defaults to `Authorization`.
+
+Specifies client headers that can contain Basic credentials. You can specify
+multiple headers by separating them with a comma.
+
+Credentials in these headers are validated and stripped from the request before
+it gets forwarded to the Subsonic server. To avoid HPP vulnerabilities, the list
+should contain at least all BasicAuth headers supported by your Subsonic server,
+unless you remove them using another middleware.
+
 **`debug`**
 
 Optional, defaults to `false`.
