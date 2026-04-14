@@ -77,13 +77,19 @@ type Config struct {
 	// subsonic server, unless you remove them from client requests using
 	// another middleware.
 	ClientHeaders string `json:"client-headers"`
+
+	// Name of the header used to propagate the authenticated user.
+	//
+	// The default value is "Remote-User".
+	ExtAuthUserHeader string `json:"ext-auth-user-header"`
 }
 
 func CreateConfig() *Config {
 	return &Config{
-		Header:        "Authorization",
-		ClientHeaders: "Authorization",
-		Debug:         false,
+		Header:            "Authorization",
+		ClientHeaders:     "Authorization",
+		ExtAuthUserHeader: "Remote-User",
+		Debug:             false,
 	}
 }
 
@@ -155,6 +161,7 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 	if propagateHeader {
 		DEBUG.Printf("Propagating header for user: %s", creds.user)
 		req.Header.Set(mw.config.Header, creds.ToBasicAuth())
+		req.Header.Set(mw.config.ExtAuthUserHeader, creds.user)
 	}
 
 	if interceptResponse {
