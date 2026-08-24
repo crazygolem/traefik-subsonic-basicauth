@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -411,6 +412,18 @@ func (res *subsonicResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error)
 	return nil, nil, fmt.Errorf("%T is not an http.Hijacker", res.ResponseWriter)
 }
 
+var SAFE_JSONP_CALLBACK = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$`)
+
+// Checks whether the callback name is safe to splice directly into a JSONP
+// response body.
+// Only simple, dotted JS identifiers are allowed, which is what legitimate
+// subsonic clients are expected to use in practice.
+// The length is also capped to guard against pathological inputs, but should
+// allow realistic long-ish names.
+func isSafeJsonpCallback(name string) bool {
+	return name != "" && len(name) < 128 && SAFE_JSONP_CALLBACK.MatchString(name)
+}
+
 // Immediately respond with a subsonic error
 func (res *subsonicResponseWriter) sendError(err *Error) {
 	res.intercepted = true
@@ -427,11 +440,24 @@ func (res *subsonicResponseWriter) sendError(err *Error) {
 	var mime string
 	var body []byte
 
-	switch res.format {
-	case "json":
+	res.Header().Del("Content-Type")
+	res.Header().Del("Content-Length")
+	res.Header().Set("X-Content-Type-Options", "nosniff")
+
+	switch {
+	case res.format == "json":
 		mime = "application/json"
 		body, _ = json.Marshal(&JsonWrapper{Subsonic: response})
-	case "jsonp":
+	case res.format == "jsonp" && !isSafeJsonpCallback(res.callback):
+		// Bypass subsonic response formatting: There is no safe way to hand the
+		// response to a client that expects a jsonp payload with an unsafe
+		// jsonp callback.
+		DEBUG.Printf("Rejecting unsafe JSONP callback")
+		res.Header().Set("Content-Type", "text/plain")
+		res.ResponseWriter.WriteHeader(400)
+		res.ResponseWriter.Write([]byte("Invalid or unsafe JSONP callback"))
+		return
+	case res.format == "jsonp":
 		mime = "application/javascript"
 		body, _ = json.Marshal(&JsonWrapper{Subsonic: response})
 		body = []byte(fmt.Sprintf("%s(%s)", res.callback, body))
@@ -440,7 +466,6 @@ func (res *subsonicResponseWriter) sendError(err *Error) {
 		body, _ = xml.Marshal(&response)
 	}
 
-	res.Header().Del("Content-Length")
 	res.Header().Set("Content-Type", mime)
 	res.ResponseWriter.WriteHeader(200)
 	res.ResponseWriter.Write(body)
