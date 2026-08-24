@@ -394,7 +394,8 @@ func (res *subsonicResponseWriter) WriteHeader(statusCode int) {
 // ignored if we already sent a subsonic response.
 func (res *subsonicResponseWriter) Write(data []byte) (n int, err error) {
 	if res.intercepted {
-		return 0, nil
+		// Fake success in order to adhere to the io.Writer interface
+		return len(data), nil
 	}
 	return res.ResponseWriter.Write(data)
 }
