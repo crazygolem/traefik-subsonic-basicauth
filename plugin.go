@@ -254,13 +254,12 @@ func extractSubsonicAuthQuery(r *http.Request) (*credentials, *Error) {
 		creds = c
 	}
 
-	var query = r.URL.Query()
-	query.Del("u")
-	query.Del("p")
-	query.Del("t")
-	query.Del("s")
+	params.Del("u")
+	params.Del("p")
+	params.Del("t")
+	params.Del("s")
 
-	r.URL.RawQuery = query.Encode()
+	r.URL.RawQuery = params.Encode()
 	r.RequestURI = r.URL.RequestURI()
 
 	return creds, nil
