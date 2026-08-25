@@ -88,7 +88,7 @@ request.
 Optional, defaults to `Authorization`.
 
 Specifies client headers that can contain Basic credentials. You can specify
-multiple headers by separating them with a comma.
+multiple headers by separating them with commas and/or whitespace.
 
 Credentials in these headers are validated and stripped from the request before
 it gets forwarded to the Subsonic server. To avoid HPP vulnerabilities, the list

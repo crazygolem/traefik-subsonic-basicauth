@@ -17,6 +17,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 var DEBUG = log.New(io.Discard, "DEBUG [subsonic-basicauth]: ", 0)
@@ -70,7 +71,7 @@ type Config struct {
 	Header string `json:"header"`
 
 	// Name of headers that clients can use to send BasicAuth credentials.
-	// Multiple headers can be specified separated by a comma.
+	// Multiple headers can be specified separated by commas and/or whitespace.
 	//
 	// The default value is "Authorization".
 	//
@@ -144,9 +145,14 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 	var propagateHeader = mw.config.Header != ""
 	var interceptResponse = mw.config.Header != "" && mw.config.Auth == "proxy"
 
+	var clientHeaders = strings.FieldsFunc(
+		mw.config.ClientHeaders,
+		func(r rune) bool { return r == ',' || unicode.IsSpace(r) },
+	)
+
 	var creds *credentials
 
-	if c, err := extractCredentials(req, strings.Split(mw.config.ClientHeaders, ",")); err != nil {
+	if c, err := extractCredentials(req, clientHeaders); err != nil {
 		res.sendError(err)
 		return
 	} else {
