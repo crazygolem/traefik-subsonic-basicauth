@@ -42,9 +42,9 @@ type Config struct {
 	//
 	//   SECURITY NOTES:
 	//   - If used with a ForwardAuth middleware, make sure to remove the
-	//     BasicAuth header after the authentication and before forwarding the
-	//     request to the backend. Traefik's architecture makes it impossible to
-	//     handle this directly in this plugin.
+	//     BasicAuth header after the ForwardAuth authentication and before
+	//     forwarding the request to the backend. Traefik's architecture makes
+	//     it impossible to handle this directly in this plugin.
 	//   - Make sure to check your subsonic server's documentation and disable
 	//     authentication mechanisms not supported by this plugin, or prevent
 	//     them from being used by clients (e.g. by stripping the corresponding

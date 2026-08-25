@@ -28,9 +28,9 @@ The reasons for this are
    nowadays), and the goal of this plugin is to get rid of this madness.
 
 From a security standpoint, letting clients transmit their credentials with the
-old subsonic scheme is not ideal, but if the connection is made over HTTPS it is
-similar in principle to authentication mechanisms you find on most websites,
-with the following caveats:
+old subsonic scheme is not ideal, but **if the connection is made over HTTPS**
+it is similar in principle to authentication mechanisms you find on most
+websites, with the following caveats:
 1. **The password can end up in server logs**: Servers usually avoid logging
    the body of incoming requests, but the path and query parameters are often
    logged. This is somewhat mitigated with subsonic's token scheme where the
@@ -74,6 +74,21 @@ not look the same as an HTTP authentication error, and clients are expecting a
 proper subsonic error when authentication fails, which cannot be expected from
 a generic third-party authentication service.
 
+> [!CAUTION]
+>
+> Make sure to check your subsonic server's documentation and disable
+> authentication mechanisms not supported by this plugin, or prevent them from
+> being used by clients (e.g. by stripping the corresponding credentials from
+> requests).
+>
+> If not done correctly, **this could leave your system vulnerable to HPP
+> attacks**, where different credentials are retrieved in different ways by
+> different components of your system.
+>
+> Credential sources not supported by this plugin could include e.g.
+> non-standard headers (see the `client-headers` option), cookies, non-standard
+> query parameters or non-standard request body.
+
 **`header`**
 
 Optional, defaults to `Authorization`.
@@ -82,6 +97,17 @@ Specifies the header that gets propagated with the Basic credentials. An empty
 value disables header propagation and response rewriting. The Subsonic
 authentication parameters still get validated and removed from the forwarded
 request.
+
+> [!CAUTION]
+>
+> When this plugin is used in proxy authentication mode (see the `auth` option)
+> together with a third-party authentication service (e.g. using Traefik's
+> ForwardAuth middleware), make sure to remove the header after the
+> authentication and before forwarding the request to the backend to prevent the
+> credentials from leaking to the backend.
+>
+> Traefik's architecture makes it impossible to handle this from this plugin so
+> you have to do it yourself.
 
 **`client-headers`**
 
