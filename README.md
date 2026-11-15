@@ -93,10 +93,11 @@ a generic third-party authentication service.
 
 Optional, defaults to `Authorization`.
 
-Specifies the header that gets propagated with the Basic credentials. An empty
-value disables header propagation and response rewriting. The Subsonic
-authentication parameters still get validated and removed from the forwarded
-request.
+Specifies the header that gets propagated with the Basic credentials. The
+header name is case-insensitive, and an invalid name makes the configuration
+fail to load. An empty value disables header propagation and response
+rewriting. The Subsonic authentication parameters still get validated and
+removed from the forwarded request.
 
 > [!CAUTION]
 >
@@ -114,7 +115,8 @@ request.
 Optional, defaults to `Authorization`.
 
 Specifies client headers that can contain Basic credentials. You can specify
-multiple headers by separating them with commas and/or whitespace.
+multiple headers by separating them with commas and/or whitespace. Header names
+are case-insensitive, and an invalid name makes the configuration fail to load.
 
 Credentials in these headers are validated and stripped from the request before
 it gets forwarded to the Subsonic server. To avoid HPP vulnerabilities, the list

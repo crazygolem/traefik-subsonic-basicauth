@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -96,27 +97,76 @@ func CreateConfig() *Config {
 }
 
 type Middleware struct {
-	config *Config
-	name   string
-	next   http.Handler
-	log    logger
+	config        *Config
+	clientHeaders []string // Parsed from config.ClientHeaders
+	name          string
+	next          http.Handler
+	log           logger
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+	// Traefik logs the errors returned here and shows them in its dashboard,
+	// so they are not logged by the plugin, which would duplicate them.
+	// Traefik's log line names the router but not the middleware, so the
+	// middleware instance name is added to the message instead.
+	var configError = func(format string, args ...any) error {
+		return fmt.Errorf("[%s] %s", name, fmt.Sprintf(format, args...))
+	}
+
 	switch config.Auth {
 	case "backend", "proxy":
 	default:
-		return nil, fmt.Errorf("invalid 'auth' parameter: %s", config.Auth)
+		return nil, configError("invalid 'auth' parameter: %s", config.Auth)
+	}
+
+	// An empty value enables the sanitization-only mode.
+	if config.Header != "" && !HEADER_NAME.MatchString(config.Header) {
+		return nil, configError("invalid 'header' parameter: invalid header name: %q", config.Header)
+	}
+
+	var clientHeaders = parseHeaderList(config.ClientHeaders)
+	for _, header := range clientHeaders {
+		if !HEADER_NAME.MatchString(header) {
+			return nil, configError("invalid 'client-headers' parameter: invalid header name: %q", header)
+		}
 	}
 
 	var mw = &Middleware{
-		config: config,
-		name:   name,
-		next:   next,
-		log:    logger{name},
+		config:        config,
+		clientHeaders: clientHeaders,
+		name:          name,
+		next:          next,
+		log:           logger{name},
 	}
 	mw.log.Debugf("Plugin instantiated; config: %+v", config)
 	return mw, nil
+}
+
+// Matches a header name, which must be a token as defined in RFC 9110.
+var HEADER_NAME = regexp.MustCompile("^[0-9A-Za-z!#$%&'*+.^_`|~-]+$")
+
+// Parses a list of header names separated by commas and/or whitespace. The
+// names are returned in canonical form and without duplicates, so that they
+// can be looked up directly in an http.Header. They are not validated, but
+// canonicalization only changes the case of letters, so it doesn't affect
+// their validity.
+func parseHeaderList(list string) []string {
+	var names = strings.FieldsFunc(
+		list,
+		func(r rune) bool { return r == ',' || unicode.IsSpace(r) },
+	)
+
+	var headers = make([]string, 0, len(names))
+	var seen = make(map[string]bool, len(names))
+	for _, name := range names {
+		name = http.CanonicalHeaderKey(name)
+		if !seen[name] {
+			seen[name] = true
+			headers = append(headers, name)
+		}
+	}
+
+	return headers
 }
 
 func (mw *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
@@ -169,14 +219,9 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 	var propagateHeader = mw.config.Header != ""
 	var interceptResponse = mw.config.Header != "" && mw.config.Auth == "proxy"
 
-	var clientHeaders = strings.FieldsFunc(
-		mw.config.ClientHeaders,
-		func(r rune) bool { return r == ',' || unicode.IsSpace(r) },
-	)
-
 	var creds *credentials
 
-	if c, err := extractCredentials(req, clientHeaders, mw.log); err != nil {
+	if c, err := extractCredentials(req, mw.clientHeaders, mw.log); err != nil {
 		res.sendError(err)
 		return
 	} else {
@@ -207,6 +252,8 @@ func (c *credentials) ToBasicAuth() string {
 
 // Extracts and strips credentials from the request. If credentials are present
 // in several places, ensures that they are consistent.
+//
+// The header names must be in canonical form (see parseHeaderList).
 func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger) (*credentials, *Error) {
 	var credentials = make([]*credentials, 0)
 
@@ -377,12 +424,13 @@ func handleSubsonicAuth(params url.Values) (*credentials, *Error) {
 	}
 }
 
+// The header name must be in canonical form (see parseHeaderList).
 func extractBasicAuth(r *http.Request, header string) (*credentials, *Error) {
-	var h = r.Header[http.CanonicalHeaderKey(header)]
+	var h = r.Header[header]
 	switch len(h) {
 	case 1:
 		if u, p, ok := parseBasicAuth(h[0]); ok && u != "" && p != "" {
-			r.Header.Del(header)
+			delete(r.Header, header)
 			return &credentials{u, p}, nil
 		}
 
@@ -459,18 +507,21 @@ func (res *subsonicResponseWriter) Write(data []byte) (n int, err error) {
 	return res.ResponseWriter.Write(data)
 }
 
+// Delegates to the original writer through an http.ResponseController, which
+// also finds a Flusher behind writers that only implement Unwrap.
 func (res *subsonicResponseWriter) Flush() {
-	if r, ok := res.ResponseWriter.(http.Flusher); ok {
+	var err = http.NewResponseController(res.ResponseWriter).Flush()
+	if !errors.Is(err, http.ErrNotSupported) {
 		res.started = true // Implicitly sends a 200 if WriteHeader wasn't called
-		r.Flush()
 	}
 }
 
+// Delegates to the original writer through an http.ResponseController, which
+// also finds a Hijacker behind writers that only implement Unwrap, and returns
+// an error matching http.ErrNotSupported if there is none. The reverse proxy
+// reports that error, so it is not logged here.
 func (res *subsonicResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if r, ok := res.ResponseWriter.(http.Hijacker); ok {
-		return r.Hijack()
-	}
-	return nil, nil, fmt.Errorf("%T is not an http.Hijacker", res.ResponseWriter)
+	return http.NewResponseController(res.ResponseWriter).Hijack()
 }
 
 var SAFE_JSONP_CALLBACK = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$`)
