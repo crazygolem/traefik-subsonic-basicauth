@@ -386,6 +386,7 @@ type subsonicResponseWriter struct {
 	format      string
 	callback    string
 	intercepted bool
+	started     bool
 	log         logger
 }
 
@@ -393,12 +394,20 @@ type subsonicResponseWriter struct {
 // response to ensure that clients get an appropriate subsonic error instead of
 // an HTTP one.
 func (res *subsonicResponseWriter) WriteHeader(statusCode int) {
-	if statusCode == 401 || statusCode == 403 || statusCode == 407 {
+	if res.intercepted {
+		return
+	}
+
+	if !res.started && (statusCode == 401 || statusCode == 403 || statusCode == 407) {
 		res.log.Debugf("Rewriting authentication error response: %d", statusCode)
 		res.sendError(&Error{40, "Wrong username or password"})
 		return
 	}
 
+	// Informational (1xx) responses can be followed by the final one.
+	if statusCode >= 200 || statusCode == http.StatusSwitchingProtocols {
+		res.started = true
+	}
 	res.ResponseWriter.WriteHeader(statusCode)
 }
 
@@ -409,11 +418,13 @@ func (res *subsonicResponseWriter) Write(data []byte) (n int, err error) {
 		// Fake success in order to adhere to the io.Writer interface
 		return len(data), nil
 	}
+	res.started = true // Implicitly sends a 200 if WriteHeader wasn't called
 	return res.ResponseWriter.Write(data)
 }
 
 func (res *subsonicResponseWriter) Flush() {
 	if r, ok := res.ResponseWriter.(http.Flusher); ok {
+		res.started = true // Implicitly sends a 200 if WriteHeader wasn't called
 		r.Flush()
 	}
 }
@@ -473,7 +484,7 @@ func (res *subsonicResponseWriter) sendError(err *Error) {
 	case res.format == "jsonp":
 		mime = "application/javascript"
 		body, _ = json.Marshal(&JsonWrapper{Subsonic: response})
-		body = []byte(fmt.Sprintf("%s(%s)", res.callback, body))
+		body = fmt.Appendf(nil, "%s(%s)", res.callback, body)
 	default:
 		mime = "application/xml"
 		body, _ = xml.Marshal(&response)
