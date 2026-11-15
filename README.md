@@ -121,12 +121,15 @@ it gets forwarded to the Subsonic server. To avoid HPP vulnerabilities, the list
 should contain at least all BasicAuth headers supported by your Subsonic server,
 unless you remove them using another middleware.
 
-**`debug`**
+## Debug logs
 
-Optional, defaults to `false`.
+The plugin writes debug logs, which Traefik only shows when its log level is
+set to `DEBUG` (e.g. `--log.level=DEBUG`). Each line is prefixed with the
+middleware's name. Debug logs should not contain sensitive data related to
+subsonic, but they do include the username.
 
-Controls whether debug logs are produced. Debug logs should not contain
-sensitive data related to subsonic.
+The former `debug` option has been removed and is ignored if still present in
+your configuration.
 
 ## Examples
 

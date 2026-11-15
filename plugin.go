@@ -9,18 +9,29 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
-	"log"
 	"mime"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"unicode"
 )
 
-var DEBUG = log.New(io.Discard, "DEBUG [subsonic-basicauth]: ", 0)
+// Writes logs for one middleware instance.
+//
+// Traefik has no logging API for Yaegi plugins: it captures their stdout and
+// logs it at DEBUG (and stderr at ERROR), tagged with the plugin name. Debug
+// logs are therefore only visible when Traefik's log level is DEBUG. Each line
+// is prefixed with the middleware instance name, so that lines from different
+// instances can be told apart.
+type logger struct {
+	name string
+}
+
+func (l logger) Debugf(format string, args ...any) {
+	fmt.Printf("[%s] %s\n", l.name, fmt.Sprintf(format, args...))
+}
 
 type Config struct {
 	// # Authentication mode
@@ -56,10 +67,6 @@ type Config struct {
 	//     non-standard query parameters.
 	Auth string `json:"auth"`
 
-	// Enable debug logs. Does not contain sensitive data related to the
-	// subsonic authentication.
-	Debug bool `json:"debug"`
-
 	// Name of the header used to propagate the BasicAuth token.
 	//
 	// The default value is "Authorization".
@@ -85,7 +92,6 @@ func CreateConfig() *Config {
 	return &Config{
 		Header:        "Authorization",
 		ClientHeaders: "Authorization",
-		Debug:         false,
 	}
 }
 
@@ -93,41 +99,40 @@ type Middleware struct {
 	config *Config
 	name   string
 	next   http.Handler
+	log    logger
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	if config.Debug {
-		DEBUG.SetFlags(log.LstdFlags)
-		DEBUG.SetOutput(os.Stdout)
-	}
-
 	switch config.Auth {
 	case "backend", "proxy":
 	default:
 		return nil, fmt.Errorf("invalid 'auth' parameter: %s", config.Auth)
 	}
 
-	DEBUG.Printf("Plugin instantiated: %s; config: %+v", name, config)
-	return &Middleware{
+	var mw = &Middleware{
 		config: config,
 		name:   name,
 		next:   next,
-	}, nil
+		log:    logger{name},
+	}
+	mw.log.Debugf("Plugin instantiated; config: %+v", config)
+	return mw, nil
 }
 
 func (mw *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
-	DEBUG.Printf("Handling request: %s", req.URL.Path)
+	mw.log.Debugf("Handling request: %s", req.URL.Path)
 
 	// req.ParseForm() is called once at the beginning of the request so that
 	// req.Form can be used to retrieve parameters irrespective of the request
 	// method. For security-sensitive parameters, req.URL.Query() (or
 	// req.URL.RawQuery) and req.PostForm must be used.
 	if err := req.ParseForm(); err != nil {
-		DEBUG.Printf("Error when parsing form: %s", err)
+		mw.log.Debugf("Error when parsing form: %s", err)
 		var subres = &subsonicResponseWriter{
 			ResponseWriter: res,
 			format:         req.URL.Query().Get("f"),
 			callback:       req.URL.Query().Get("callback"),
+			log:            mw.log,
 		}
 		subres.sendError(&Error{0, "Invalid request"})
 		return
@@ -137,6 +142,7 @@ func (mw *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		ResponseWriter: res,
 		format:         req.Form.Get("f"),
 		callback:       req.Form.Get("callback"),
+		log:            mw.log,
 	}
 	mw.serveHTTP(subres, req)
 }
@@ -152,7 +158,7 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 
 	var creds *credentials
 
-	if c, err := extractCredentials(req, clientHeaders); err != nil {
+	if c, err := extractCredentials(req, clientHeaders, mw.log); err != nil {
 		res.sendError(err)
 		return
 	} else {
@@ -160,7 +166,7 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 	}
 
 	if propagateHeader {
-		DEBUG.Printf("Propagating header for user: %s", creds.user)
+		mw.log.Debugf("Propagating header for user: %s", creds.user)
 		req.Header.Set(mw.config.Header, creds.ToBasicAuth())
 	}
 
@@ -183,13 +189,13 @@ func (c *credentials) ToBasicAuth() string {
 
 // Extracts and strips credentials from the request. If credentials are present
 // in several places, ensures that they are consistent.
-func extractCredentials(req *http.Request, basicAuthHeaders []string) (*credentials, *Error) {
+func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger) (*credentials, *Error) {
 	var credentials = make([]*credentials, 0)
 
-	if creds, err := extractSubsonicAuthQuery(req); err != nil {
+	if creds, err := extractSubsonicAuthQuery(req, log); err != nil {
 		return nil, err
 	} else if creds != nil {
-		DEBUG.Printf("Found credentials in query parameters")
+		log.Debugf("Found credentials in query parameters")
 		credentials = append(credentials, creds)
 	}
 
@@ -210,7 +216,7 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string) (*credenti
 		if creds, err := extractSubsonicAuthBody(req); err != nil {
 			return nil, err
 		} else if creds != nil {
-			DEBUG.Printf("Found credentials in POST body")
+			log.Debugf("Found credentials in POST body")
 			credentials = append(credentials, creds)
 		}
 	}
@@ -219,7 +225,7 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string) (*credenti
 		if creds, err := extractBasicAuth(req, header); err != nil {
 			return nil, err
 		} else if creds != nil {
-			DEBUG.Printf("Found BasicAuth credentials in header: %s", header)
+			log.Debugf("Found BasicAuth credentials in header: %s", header)
 			credentials = append(credentials, creds)
 		}
 	}
@@ -238,10 +244,10 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string) (*credenti
 	return creds, nil
 }
 
-func extractSubsonicAuthQuery(r *http.Request) (*credentials, *Error) {
+func extractSubsonicAuthQuery(r *http.Request, log logger) (*credentials, *Error) {
 	var params url.Values
 	if p, err := url.ParseQuery(r.URL.RawQuery); err != nil {
-		DEBUG.Printf("Error when parsing query: %s", err)
+		log.Debugf("Error when parsing query: %s", err)
 		return nil, &Error{0, "Invalid request"}
 	} else {
 		params = p
@@ -380,6 +386,7 @@ type subsonicResponseWriter struct {
 	format      string
 	callback    string
 	intercepted bool
+	log         logger
 }
 
 // Wraps the original method and intercepts authentication errors, rewriting the
@@ -387,7 +394,7 @@ type subsonicResponseWriter struct {
 // an HTTP one.
 func (res *subsonicResponseWriter) WriteHeader(statusCode int) {
 	if statusCode == 401 || statusCode == 403 || statusCode == 407 {
-		DEBUG.Printf("Rewriting authentication error response: %d", statusCode)
+		res.log.Debugf("Rewriting authentication error response: %d", statusCode)
 		res.sendError(&Error{40, "Wrong username or password"})
 		return
 	}
@@ -458,7 +465,7 @@ func (res *subsonicResponseWriter) sendError(err *Error) {
 		// Bypass subsonic response formatting: There is no safe way to hand the
 		// response to a client that expects a jsonp payload with an unsafe
 		// jsonp callback.
-		DEBUG.Printf("Rejecting unsafe JSONP callback")
+		res.log.Debugf("Rejecting unsafe JSONP callback")
 		res.Header().Set("Content-Type", "text/plain")
 		res.ResponseWriter.WriteHeader(400)
 		res.ResponseWriter.Write([]byte("Invalid or unsafe JSONP callback"))
