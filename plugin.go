@@ -207,7 +207,26 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger
 	// legacy subsonic clients and servers, and to prevent a potential HTTP
 	// Parameter Pollution vulnerability. An alternative would be to allow only
 	// GET requests, but this would limit the usefulness of this plugin.
-	if req.Method == "POST" {
+	//
+	// The OpenSubsonic spec is ambiguous on whether the Content-Type header is
+	// required [1], and it could be interpreted as the header being optional as
+	// long as the body's encoding conforms:
+	//
+	// > This extension requires that the server support passing
+	// > API arguments via POST with the arguments respecting the
+	// > application/x-www-form-urlencoded format.
+	//
+	// This plugin requires the header.
+	//
+	// As an exception, POST requests without a body are accepted whatever their
+	// content type, as they cannot carry parameters (some clients could send
+	// POST requests without a body, and the parameters still in the query). For
+	// incoming requests, a ContentLength of 0 means that the body is known to
+	// be empty, whereas a body of unknown length (e.g. chunked) has a
+	// ContentLength of -1 and is still checked.
+	//
+	// [1]: https://opensubsonic.github.io/docs/extensions/formpost/
+	if req.Method == "POST" && req.ContentLength != 0 {
 		var ct, _, err = mime.ParseMediaType(req.Header.Get("Content-Type"))
 		if err != nil || ct != "application/x-www-form-urlencoded" {
 			return nil, &Error{0, "Invalid request"}
