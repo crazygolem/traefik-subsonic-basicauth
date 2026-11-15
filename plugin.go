@@ -122,19 +122,37 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 func (mw *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	mw.log.Debugf("Handling request: %s", req.URL.Path)
 
+	// Errors raised before the form is parsed can only use the response format
+	// requested in the query.
+	var sendEarlyError = func(err *Error) {
+		var query = req.URL.Query()
+		var subres = &subsonicResponseWriter{
+			ResponseWriter: res,
+			format:         query.Get("f"),
+			callback:       query.Get("callback"),
+			log:            mw.log,
+		}
+		subres.sendError(err)
+	}
+
+	// The (Open)Subsonic API only uses GET and POST. HEAD and OPTIONS are also
+	// allowed for browsers and clients that use HTTP caching. Some servers
+	// accept other methods, but this plugin rejects them.
+	switch req.Method {
+	case http.MethodGet, http.MethodPost, http.MethodHead, http.MethodOptions:
+	default:
+		mw.log.Debugf("Rejecting unsupported HTTP method: %s", req.Method)
+		sendEarlyError(&Error{0, "HTTP method not supported"})
+		return
+	}
+
 	// req.ParseForm() is called once at the beginning of the request so that
 	// req.Form can be used to retrieve parameters irrespective of the request
 	// method. For security-sensitive parameters, req.URL.Query() (or
 	// req.URL.RawQuery) and req.PostForm must be used.
 	if err := req.ParseForm(); err != nil {
 		mw.log.Debugf("Error when parsing form: %s", err)
-		var subres = &subsonicResponseWriter{
-			ResponseWriter: res,
-			format:         req.URL.Query().Get("f"),
-			callback:       req.URL.Query().Get("callback"),
-			log:            mw.log,
-		}
-		subres.sendError(&Error{0, "Invalid request"})
+		sendEarlyError(&Error{0, "Invalid request"})
 		return
 	}
 
