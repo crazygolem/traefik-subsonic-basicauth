@@ -357,6 +357,13 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger
 		req.ContentLength = int64(len(body))
 	}
 
+	// req.Form is a separate map, built by req.ParseForm() from the query and
+	// req.PostForm before they were stripped, so it still holds the
+	// credentials. It is reset rather than stripped, so that it can't get out
+	// of sync with them: the next call to req.ParseForm() (e.g. through
+	// req.FormValue()) rebuilds it from the stripped query and req.PostForm.
+	req.Form = nil
+
 	for _, name := range basicAuthHeaders {
 		layers = append(layers, extractCredentialsFromHeader(req.Header, name))
 	}
