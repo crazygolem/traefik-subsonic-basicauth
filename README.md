@@ -55,6 +55,21 @@ once a consensus has been reached and clients and servers adopt the new scheme.
 [os-api-auth]: https://github.com/opensubsonic/open-subsonic-api/discussions/25
 [os-apikey]: https://opensubsonic.github.io/docs/extensions/apikeyauth/
 
+## Traefik's access log
+
+Traefik's access log records credentials sent in the query string. It logs the
+request path and query as received, before any middleware runs, so this plugin
+can't hide them. To keep them out of the access log, either:
+
+* drop query parameters from the access log with
+  `--accesslog.fields.queryparameters.defaultmode=drop` (Traefik v3.6.19,
+  v3.7.3 and later; applies to all routers), or
+* disable access logs on your Subsonic router, e.g.
+  `traefik.http.routers.subsonic.observability.accesslogs: false` (Traefik v3.3
+  and later).
+
+Other proxies in front of Traefik, such as a load balancer or CDN, may log the
+query string too.
 
 # Configuration
 
@@ -98,6 +113,9 @@ Bearer token (see the `apikey` option). The header name is case-insensitive,
 and an invalid name makes the configuration fail to load. An empty value
 disables header propagation and response rewriting. The Subsonic authentication
 parameters still get validated and removed from the forwarded request.
+
+If you log request headers in Traefik's access log, drop or redact this header:
+Traefik reads them after the plugin has set them.
 
 > [!CAUTION]
 >
