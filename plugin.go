@@ -634,6 +634,22 @@ func isSafeJsonpCallback(name string) bool {
 	return name != "" && len(name) < 128 && SAFE_JSONP_CALLBACK.MatchString(name)
 }
 
+// Response headers that describe the body or status of a response, which become
+// stale when a response is rewritten into a subsonic error.
+var REPLACED_RESPONSE_HEADERS = []string{
+	"Content-Type",
+	"Content-Length",
+	"Content-Encoding",
+	"Content-Language",
+	"Content-Location",
+	"Content-Range",
+	"Content-Disposition",
+	"ETag",
+	"Last-Modified",
+	"WWW-Authenticate",
+	"Proxy-Authenticate",
+}
+
 // Immediately respond with a subsonic error
 func (res *subsonicResponseWriter) sendError(err *Error) {
 	res.intercepted = true
@@ -650,8 +666,9 @@ func (res *subsonicResponseWriter) sendError(err *Error) {
 	var mime string
 	var body []byte
 
-	res.Header().Del("Content-Type")
-	res.Header().Del("Content-Length")
+	for _, name := range REPLACED_RESPONSE_HEADERS {
+		res.Header().Del(name)
+	}
 	res.Header().Set("X-Content-Type-Options", "nosniff")
 
 	switch {
