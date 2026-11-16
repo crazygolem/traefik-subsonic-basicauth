@@ -318,10 +318,13 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger
 		return nil, &Error{40, "Required parameters are missing: u, p"}
 	}
 
+	// OpenSubsonic has a dedicated error code for conflicting credentials (43),
+	// but it isn't part of the Subsonic spec, and the plugin can't tell whether
+	// the client supports OpenSubsonic. The generic error is used instead.
 	var creds = credentials[0]
 	for _, c := range credentials[1:] {
 		if c.user != creds.user || c.pass != creds.pass {
-			return nil, &Error{0, "Multiple credentials provided"}
+			return nil, &Error{0, "Multiple conflicting credentials provided"}
 		}
 	}
 
@@ -387,6 +390,12 @@ func handleSubsonicAuth(params url.Values) (*credentials, *Error) {
 
 	if len(params["t"]) > 0 || len(params["s"]) > 0 {
 		return nil, &Error{41, "Token authentication not supported"}
+	}
+
+	// Clients using the apiKey parameter support OpenSubsonic, so they can
+	// handle the OpenSubsonic error code.
+	if len(params["apiKey"]) > 0 {
+		return nil, &Error{42, "API key authentication not supported"}
 	}
 
 	var user string

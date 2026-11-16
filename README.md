@@ -27,6 +27,9 @@ The reasons for this are
    reversible encryption (this is true for any compliant subsonic servers
    nowadays), and the goal of this plugin is to get rid of this madness.
 
+Requests with the `apiKey` parameter from the [API key extension][os-apikey]
+are rejected too, as an API key can't be turned into BasicAuth credentials.
+
 From a security standpoint, letting clients transmit their credentials with the
 old subsonic scheme is not ideal, but **if the connection is made over HTTPS**
 it is similar in principle to authentication mechanisms you find on most
@@ -45,15 +48,15 @@ websites, with the following caveats:
 regulations and policies applicable to you. The contributors to this plugin
 decline all responsibility and liability for your use of it.**
 
-Note that the OpenSubsonic initiative is working on adding support for a modern
-authentication scheme to the subsonic protocol (cf. [os-api-auth]), with support
-from authors of actively maintained clients and servers. You are encouraged to
-stop using this plugin (and stop supporting the legacy Subsonic schemes
-altogether) once a consensus has been reached and clients and servers adopt the
-new scheme.
+Note that the OpenSubsonic initiative is working on adding support for a [modern
+authentication scheme][os-api-auth] to the subsonic protocol, with support from
+authors of actively maintained clients and servers. You are encouraged to stop
+using this plugin (and stop supporting the legacy Subsonic schemes altogether)
+once a consensus has been reached and clients and servers adopt the new scheme.
 
 
 [os-api-auth]: https://github.com/opensubsonic/open-subsonic-api/discussions/25
+[os-apikey]: https://opensubsonic.github.io/docs/extensions/apikeyauth/
 
 
 # Configuration
