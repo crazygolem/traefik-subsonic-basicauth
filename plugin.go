@@ -30,6 +30,10 @@ type logger struct {
 	name string
 }
 
+// Log a message at traefik's DEBUG level.
+//
+// Values controlled by clients must be quoted (%q), which escapes control
+// characters, so that a newline can't forge extra log lines.
 func (l logger) Debugf(format string, args ...any) {
 	fmt.Printf("[%s] %s\n", l.name, fmt.Sprintf(format, args...))
 }
@@ -193,7 +197,7 @@ func parseHeaderList(list string) []string {
 }
 
 func (mw *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
-	mw.log.Debugf("Handling request: %s", req.URL.Path)
+	mw.log.Debugf("Handling request: %q", req.URL.Path)
 
 	// Errors raised before the form is parsed can only use the response format
 	// requested in the query.
@@ -255,13 +259,23 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 		return
 	}
 
+	// The header value is built even if it isn't propagated, so that the same
+	// credentials are rejected in every mode.
+	var headerValue, encodeErr = creds.HeaderValue()
+	if encodeErr != nil {
+		// Error messages are constant, so they don't leak credentials.
+		mw.log.Debugf("Credentials can't be encoded in a header: %s", encodeErr.Message)
+		res.sendError(encodeErr)
+		return
+	}
+
 	if propagateHeader {
 		if creds.apiKey != "" {
 			mw.log.Debugf("Propagating header for API key")
 		} else {
-			mw.log.Debugf("Propagating header for user: %s", creds.user)
+			mw.log.Debugf("Propagating header for user: %q", creds.user)
 		}
-		req.Header.Set(mw.config.Header, creds.HeaderValue())
+		req.Header.Set(mw.config.Header, headerValue)
 	}
 
 	if interceptResponse {
@@ -276,18 +290,36 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 }
 
 // Either a username and password, or an API key.
+// Note: This implementation assumes that an empty value is rejected; if this
+// ever changes, the struct needs to be adapted.
 type credentials struct {
 	user   string
 	pass   string
 	apiKey string
 }
 
-func (c *credentials) HeaderValue() string {
+// Encodes the credentials as a Bearer token for an API key, or as Basic
+// credentials otherwise. Returns an error for credentials that the header can't
+// carry.
+func (c *credentials) HeaderValue() (string, *Error) {
 	if c.apiKey != "" {
-		return "Bearer " + c.apiKey
+		// Clients using the apiKey parameter support OpenSubsonic, so they can
+		// handle the OpenSubsonic error codes.
+		if !BEARER_TOKEN.MatchString(c.apiKey) {
+			return "", &Error{44, "Invalid API key"}
+		}
+		return "Bearer " + c.apiKey, nil
+	}
+
+	// BasicAuth splits the credentials on the first colon, so the backend would
+	// read user "admin:x" with password "y" as user "admin" with password
+	// "x:y". RFC 7617 doesn't allow colons in usernames, so such a user can't
+	// log in through BasicAuth anyway.
+	if strings.Contains(c.user, ":") {
+		return "", &Error{40, "Wrong username or password"}
 	}
 	var token = base64.StdEncoding.EncodeToString([]byte(c.user + ":" + c.pass))
-	return "Basic " + token
+	return "Basic " + token, nil
 }
 
 // The result of looking for one authentication mechanism in one part of the
@@ -483,8 +515,7 @@ func parseApiKeyAuth(params url.Values) (*credentials, *Error) {
 		return nil, nil
 	case len(keys) > 1:
 		return nil, &Error{0, "Invalid request"}
-	// Keys that aren't valid bearer tokens can't be propagated
-	case !BEARER_TOKEN.MatchString(keys[0]):
+	case keys[0] == "":
 		return nil, &Error{44, "Invalid API key"}
 	default:
 		return &credentials{apiKey: keys[0]}, nil

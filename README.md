@@ -71,6 +71,23 @@ can't hide them. To keep them out of the access log, either:
 Other proxies in front of Traefik, such as a load balancer or CDN, may log the
 query string too.
 
+# Restrictions on Subsonic credentials
+
+Credentials are propagated in a header that can't carry every value a Subsonic
+server might accept. The plugin rejects such credentials:
+
+* **Usernames can't contain a colon (`:`).** BasicAuth separates the username
+  from the password at the first colon, so the backend would see a different
+  username. Requests with a colon in the `u` parameter fail with error 40.
+  Passwords can contain colons.
+* **API keys must be valid Bearer tokens**: letters, digits and `-._~+/`,
+  optionally followed by `=` padding. Requests with any other key fail with
+  error 44. This only applies with `apikey: bearer`, since otherwise every API
+  key is rejected (see the `apikey` option).
+
+The restrictions apply even when header propagation is disabled (see the
+`header` option).
+
 # Configuration
 
 **`auth`**
@@ -151,16 +168,16 @@ handled:
 * `reject`: requests with an API key are rejected.
 * `bearer`: the key is propagated as a Bearer token (`Authorization: Bearer
   <key>` with the default `header`). Your authentication service, or your
-  Subsonic server in backend authentication mode, must accept the key as a Bearer
-  token.
+  Subsonic server in backend authentication mode, must accept the key as a
+  Bearer token.
 
 Clients must send the key in the `apiKey` parameter (query or POST body), as
 the API key extension specifies. Bearer tokens sent by clients in headers are
 not treated as API keys.
 
 The key must be sent without any other credentials, and must be a valid Bearer
-token: letters, digits and `-._~+/`, optionally followed by `=` padding. In
-proxy authentication mode, authentication failures are reported to clients as
+token (see [Restrictions on Subsonic credentials](#restrictions-on-subsonic-credentials)).
+In proxy authentication mode, authentication failures are reported to clients as
 an invalid API key.
 
 > [!IMPORTANT]
