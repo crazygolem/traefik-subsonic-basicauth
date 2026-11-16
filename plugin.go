@@ -241,14 +241,18 @@ func (mw *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 	var propagateHeader = mw.config.Header != ""
 	var interceptResponse = mw.config.Header != "" && mw.config.Auth == "proxy"
+	var allowApiKey = mw.config.ApiKey == "bearer"
 
-	var creds *credentials
-
-	if c, err := extractCredentials(req, mw.clientHeaders, mw.config.ApiKey == "bearer", mw.log); err != nil {
-		res.sendError(err)
+	var layers, extractErr = extractCredentials(req, mw.clientHeaders, mw.log)
+	if extractErr != nil {
+		res.sendError(extractErr)
 		return
-	} else {
-		creds = c
+	}
+
+	var creds, resolveErr = resolveCredentials(layers, allowApiKey, mw.log)
+	if resolveErr != nil {
+		res.sendError(resolveErr)
+		return
 	}
 
 	if propagateHeader {
@@ -296,18 +300,22 @@ type layer struct {
 	source string       // Part of the request, for debug logs
 }
 
-// Extracts and strips credentials from the request. If credentials are present
-// in several places, ensures that they are consistent.
+// Extracts and strips credentials from every part of the request that can
+// carry them, as layers to be resolved by resolveCredentials. Only returns an
+// error if the request itself is invalid.
 //
 // The header names must be in canonical form (see parseHeaderList).
-func extractCredentials(req *http.Request, basicAuthHeaders []string, allowApiKey bool, log logger) (*credentials, *Error) {
+func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger) ([]layer, *Error) {
 	var layers = make([]layer, 0)
 
-	if l, err := extractQueryCredentials(req, log); err != nil {
-		return nil, err
-	} else {
-		layers = append(layers, l...)
+	var query, err = url.ParseQuery(req.URL.RawQuery)
+	if err != nil {
+		log.Debugf("Error when parsing query: %s", err)
+		return nil, &Error{0, "Invalid request"}
 	}
+	layers = append(layers, extractCredentialsFromParams(query, "query parameters")...)
+	req.URL.RawQuery = query.Encode()
+	req.RequestURI = req.URL.RequestURI()
 
 	// Some subsonic clients apparently use POST with form data to transmit
 	// parameters instead of, or in addition to placing them in the query.
@@ -342,16 +350,18 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string, allowApiKe
 			return nil, &Error{0, "Invalid request"}
 		}
 
-		layers = append(layers, extractBodyCredentials(req)...)
+		// req.PostForm was filled by req.ParseForm(), in ServeHTTP.
+		layers = append(layers, extractCredentialsFromParams(req.PostForm, "POST body")...)
+		var body = req.PostForm.Encode()
+		req.Body = io.NopCloser(strings.NewReader(body))
+		req.ContentLength = int64(len(body))
 	}
 
-	for _, header := range basicAuthHeaders {
-		var found = len(req.Header[header]) > 0
-		var creds, err = extractBasicAuth(req, header)
-		layers = append(layers, layer{found: found, creds: creds, err: err, source: "header " + header})
+	for _, name := range basicAuthHeaders {
+		layers = append(layers, extractCredentialsFromHeader(req.Header, name))
 	}
 
-	return resolveCredentials(layers, allowApiKey, log)
+	return layers, nil
 }
 
 // Picks the credentials to use among the layers, or the error to report.
@@ -420,44 +430,15 @@ func resolveCredentials(layers []layer, allowApiKey bool, log logger) (*credenti
 	return creds, nil
 }
 
-func extractQueryCredentials(r *http.Request, log logger) ([]layer, *Error) {
-	var params url.Values
-	if p, err := url.ParseQuery(r.URL.RawQuery); err != nil {
-		log.Debugf("Error when parsing query: %s", err)
-		return nil, &Error{0, "Invalid request"}
-	} else {
-		params = p
-	}
-
-	var layers = extractParamCredentials(params, "query parameters")
-
-	r.URL.RawQuery = params.Encode()
-	r.RequestURI = r.URL.RequestURI()
-
-	return layers, nil
-}
-
-// Assumes req.ParseForm() has already been called
-func extractBodyCredentials(req *http.Request) []layer {
-	var params = req.PostForm
-	var layers = extractParamCredentials(params, "POST body")
-
-	var body = params.Encode()
-	req.Body = io.NopCloser(strings.NewReader(body))
-	req.ContentLength = int64(len(body))
-
-	return layers
-}
-
 // Extracts and strips the API key, and the legacy credentials (username and
 // password, or token), from the parameters, as separate layers.
-func extractParamCredentials(params url.Values, source string) []layer {
+func extractCredentialsFromParams(params url.Values, source string) []layer {
 	var keyFound = len(params["apiKey"]) > 0
 	var legacyFound = len(params["u"]) > 0 || len(params["p"]) > 0 ||
 		len(params["t"]) > 0 || len(params["s"]) > 0
 
-	var keyCreds, keyErr = handleApiKeyAuth(params)
-	var legacyCreds, legacyErr = handleLegacyAuth(params)
+	var keyCreds, keyErr = parseApiKeyAuth(params)
+	var legacyCreds, legacyErr = parseLegacyAuth(params)
 
 	params.Del("apiKey")
 	params.Del("u")
@@ -471,9 +452,24 @@ func extractParamCredentials(params url.Values, source string) []layer {
 	}
 }
 
+// Extracts and strips the BasicAuth credentials from the header, as a layer.
+//
+// The header name must be in canonical form (see parseHeaderList).
+func extractCredentialsFromHeader(header http.Header, name string) layer {
+	var values = header[name]
+	var creds, err = parseBasicAuthHeader(values)
+
+	delete(header, name)
+
+	return layer{found: len(values) > 0, creds: creds, err: err, source: "header " + name}
+}
+
+// Parses and validates the API key from the parameters. Returns neither
+// credentials nor an error if there is none.
+//
 // Clients using the apiKey parameter support OpenSubsonic, so they can handle
 // the OpenSubsonic error codes.
-func handleApiKeyAuth(params url.Values) (*credentials, *Error) {
+func parseApiKeyAuth(params url.Values) (*credentials, *Error) {
 	var keys = params["apiKey"]
 	switch {
 	case len(keys) == 0:
@@ -488,7 +484,9 @@ func handleApiKeyAuth(params url.Values) (*credentials, *Error) {
 	}
 }
 
-func handleLegacyAuth(params url.Values) (*credentials, *Error) {
+// Parses and validates the username and password from the parameters, and
+// rejects tokens. Returns neither credentials nor an error if there are none.
+func parseLegacyAuth(params url.Values) (*credentials, *Error) {
 	// Caution: url.Values.Get() returns the first parameter's value. We need to
 	// enforce that the query contains at most one of each auth parameter that
 	// we use for authentication, to avoid HTTP Parameter Pollution attacks. It
@@ -535,13 +533,15 @@ func handleLegacyAuth(params url.Values) (*credentials, *Error) {
 	}
 }
 
-// The header name must be in canonical form (see parseHeaderList).
-func extractBasicAuth(r *http.Request, header string) (*credentials, *Error) {
-	var h = r.Header[header]
-	switch len(h) {
+// Parses and validates the BasicAuth credentials from the values of a header.
+// Returns neither credentials nor an error if there are none.
+func parseBasicAuthHeader(values []string) (*credentials, *Error) {
+	switch len(values) {
 	case 1:
-		if u, p, ok := parseBasicAuth(h[0]); ok && u != "" && p != "" {
-			delete(r.Header, header)
+		// The standard library only parses BasicAuth credentials from the
+		// Authorization header, so the value is put in a throwaway request.
+		var r = http.Request{Header: http.Header{"Authorization": values}}
+		if u, p, ok := r.BasicAuth(); ok && u != "" && p != "" {
 			return &credentials{user: u, pass: p}, nil
 		}
 
@@ -554,27 +554,6 @@ func extractBasicAuth(r *http.Request, header string) (*credentials, *Error) {
 	default:
 		return nil, &Error{0, "Invalid request"}
 	}
-}
-
-// Adapted from net/http/request.go
-func parseBasicAuth(value string) (user, pass string, ok bool) {
-	const prefix = "Basic "
-
-	if len(value) < len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
-		return "", "", false
-	}
-
-	if bytes, err := base64.StdEncoding.DecodeString(value[len(prefix):]); err != nil {
-		return "", "", false
-	} else {
-		value = string(bytes)
-	}
-
-	if user, pass, ok = strings.Cut(value, ":"); !ok {
-		return "", "", false
-	}
-
-	return user, pass, true
 }
 
 type subsonicResponseWriter struct {
