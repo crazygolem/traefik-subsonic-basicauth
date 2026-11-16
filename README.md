@@ -27,9 +27,6 @@ The reasons for this are
    reversible encryption (this is true for any compliant subsonic servers
    nowadays), and the goal of this plugin is to get rid of this madness.
 
-Requests with the `apiKey` parameter from the [API key extension][os-apikey]
-are rejected too, as an API key can't be turned into BasicAuth credentials.
-
 From a security standpoint, letting clients transmit their credentials with the
 old subsonic scheme is not ideal, but **if the connection is made over HTTPS**
 it is similar in principle to authentication mechanisms you find on most
@@ -96,11 +93,11 @@ a generic third-party authentication service.
 
 Optional, defaults to `Authorization`.
 
-Specifies the header that gets propagated with the Basic credentials. The
-header name is case-insensitive, and an invalid name makes the configuration
-fail to load. An empty value disables header propagation and response
-rewriting. The Subsonic authentication parameters still get validated and
-removed from the forwarded request.
+Specifies the header that gets propagated with the Basic credentials, or the
+Bearer token (see the `apikey` option). The header name is case-insensitive,
+and an invalid name makes the configuration fail to load. An empty value
+disables header propagation and response rewriting. The Subsonic authentication
+parameters still get validated and removed from the forwarded request.
 
 > [!CAUTION]
 >
@@ -125,6 +122,36 @@ Credentials in these headers are validated and stripped from the request before
 it gets forwarded to the Subsonic server. To avoid HPP vulnerabilities, the list
 should contain at least all BasicAuth headers supported by your Subsonic server,
 unless you remove them using another middleware.
+
+**`apikey`**
+
+Optional, either `reject` (the default) or `bearer`.
+
+Specifies how the `apiKey` parameter from the [API key extension][os-apikey] is
+handled:
+
+* `reject`: requests with an API key are rejected.
+* `bearer`: the key is propagated as a Bearer token (`Authorization: Bearer
+  <key>` with the default `header`). Your authentication service, or your
+  Subsonic server in backend authentication mode, must accept the key as a Bearer
+  token.
+
+Clients must send the key in the `apiKey` parameter (query or POST body), as
+the API key extension specifies. Bearer tokens sent by clients in headers are
+not treated as API keys.
+
+The key must be sent without any other credentials, and must be a valid Bearer
+token: letters, digits and `-._~+/`, optionally followed by `=` padding. In
+proxy authentication mode, authentication failures are reported to clients as
+an invalid API key.
+
+> [!IMPORTANT]
+>
+> Clients are expected to use API keys only if the server lists the
+> `apiKeyAuthentication` extension in its `getOpenSubsonicExtensions` response,
+> which this plugin doesn't modify. If your Subsonic server doesn't support API
+> keys but your authentication service does, you have to rewrite that response
+> yourself to add the extension.
 
 ## Debug logs
 

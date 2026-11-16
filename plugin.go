@@ -40,21 +40,21 @@ type Config struct {
 	// * "backend": The subsonic backend is performing the BasicAuth
 	//   authentication.
 	//
-	//   In this mode, the SubsonicAuth parameters are removed, and the response
-	//   is not rewritten: as the backend is a subsonic server, it is expected
-	//   to sent proper subsonic responses in all situations.
+	//   In this mode, the authentication parameters are removed, and the
+	//   response is not rewritten: as the backend is a subsonic server, it is
+	//   expected to sent proper subsonic responses in all situations.
 	//
 	// * "proxy": The proxy is handling the authentication, e.g. using
 	//   ForwardAuth.
 	//
-	//   In this mode, the SubsonicAuth parameters are removed, and the response
-	//   is rewritten in case of authentication error: the proxy and the backend
-	//   authentication service are not expected to know how to properly answer
-	//   with a subsonic error, so the plugin has to intervene.
+	//   In this mode, the authentication parameters are removed, and the
+	//   response is rewritten in case of authentication error: the proxy and
+	//   the backend authentication service are not expected to know how to
+	//   properly answer with a subsonic error, so the plugin has to intervene.
 	//
 	//   SECURITY NOTES:
 	//   - If used with a ForwardAuth middleware, make sure to remove the
-	//     BasicAuth header after the ForwardAuth authentication and before
+	//     propagated header after the ForwardAuth authentication and before
 	//     forwarding the request to the backend. Traefik's architecture makes
 	//     it impossible to handle this directly in this plugin.
 	//   - Make sure to check your subsonic server's documentation and disable
@@ -68,7 +68,8 @@ type Config struct {
 	//     non-standard query parameters.
 	Auth string `json:"auth"`
 
-	// Name of the header used to propagate the BasicAuth token.
+	// Name of the header used to propagate the BasicAuth token, or the Bearer
+	// token for API keys (see `ApiKey`).
 	//
 	// The default value is "Authorization".
 	//
@@ -87,12 +88,25 @@ type Config struct {
 	// subsonic server, unless you remove them from client requests using
 	// another middleware.
 	ClientHeaders string `json:"client-headers"`
+
+	// Handling of the `apiKey` parameter of the OpenSubsonic API key extension.
+	//
+	// * "reject" (default): Requests with an API key are rejected.
+	//
+	// * "bearer": The key is propagated as a Bearer token.
+	//
+	// Clients are expected to look for the `apiKeyAuthentication` extension in
+	// the `getOpenSubsonicExtensions` response, which the plugin doesn't
+	// modify. If the backend doesn't support API keys, that response has to be
+	// rewritten.
+	ApiKey string `json:"apikey"`
 }
 
 func CreateConfig() *Config {
 	return &Config{
 		Header:        "Authorization",
 		ClientHeaders: "Authorization",
+		ApiKey:        "reject",
 	}
 }
 
@@ -131,6 +145,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		}
 	}
 
+	switch config.ApiKey {
+	case "reject", "bearer":
+	default:
+		return nil, configError("invalid 'apikey' parameter: %s", config.ApiKey)
+	}
+
 	var mw = &Middleware{
 		config:        config,
 		clientHeaders: clientHeaders,
@@ -144,6 +164,9 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 // Matches a header name, which must be a token as defined in RFC 9110.
 var HEADER_NAME = regexp.MustCompile("^[0-9A-Za-z!#$%&'*+.^_`|~-]+$")
+
+// Matches a Bearer token as defined in RFC 6750 (b64token).
+var BEARER_TOKEN = regexp.MustCompile("^[0-9A-Za-z._~+/-]+=*$")
 
 // Parses a list of header names separated by commas and/or whitespace. The
 // names are returned in canonical form and without duplicates, so that they
@@ -221,7 +244,7 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 
 	var creds *credentials
 
-	if c, err := extractCredentials(req, mw.clientHeaders, mw.log); err != nil {
+	if c, err := extractCredentials(req, mw.clientHeaders, mw.config.ApiKey == "bearer", mw.log); err != nil {
 		res.sendError(err)
 		return
 	} else {
@@ -229,39 +252,61 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 	}
 
 	if propagateHeader {
-		mw.log.Debugf("Propagating header for user: %s", creds.user)
-		req.Header.Set(mw.config.Header, creds.ToBasicAuth())
+		if creds.apiKey != "" {
+			mw.log.Debugf("Propagating header for API key")
+		} else {
+			mw.log.Debugf("Propagating header for user: %s", creds.user)
+		}
+		req.Header.Set(mw.config.Header, creds.HeaderValue())
 	}
 
 	if interceptResponse {
+		res.authError = &Error{40, "Wrong username or password"}
+		if creds.apiKey != "" {
+			res.authError = &Error{44, "Invalid API key"}
+		}
 		mw.next.ServeHTTP(&res, req)
 	} else {
 		mw.next.ServeHTTP(res.ResponseWriter, req)
 	}
 }
 
+// Either a username and password, or an API key.
 type credentials struct {
-	user string
-	pass string
+	user   string
+	pass   string
+	apiKey string
 }
 
-func (c *credentials) ToBasicAuth() string {
+func (c *credentials) HeaderValue() string {
+	if c.apiKey != "" {
+		return "Bearer " + c.apiKey
+	}
 	var token = base64.StdEncoding.EncodeToString([]byte(c.user + ":" + c.pass))
 	return "Basic " + token
+}
+
+// The result of looking for one authentication mechanism in one part of the
+// request.
+type layer struct {
+	found  bool         // Whether any of the mechanism's parameters is present
+	apiKey bool         // Whether the mechanism is API key authentication
+	creds  *credentials // Set if valid credentials were found
+	err    *Error       // Set if invalid credentials were found
+	source string       // Part of the request, for debug logs
 }
 
 // Extracts and strips credentials from the request. If credentials are present
 // in several places, ensures that they are consistent.
 //
 // The header names must be in canonical form (see parseHeaderList).
-func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger) (*credentials, *Error) {
-	var credentials = make([]*credentials, 0)
+func extractCredentials(req *http.Request, basicAuthHeaders []string, allowApiKey bool, log logger) (*credentials, *Error) {
+	var layers = make([]layer, 0)
 
-	if creds, err := extractSubsonicAuthQuery(req, log); err != nil {
+	if l, err := extractQueryCredentials(req, log); err != nil {
 		return nil, err
-	} else if creds != nil {
-		log.Debugf("Found credentials in query parameters")
-		credentials = append(credentials, creds)
+	} else {
+		layers = append(layers, l...)
 	}
 
 	// Some subsonic clients apparently use POST with form data to transmit
@@ -297,41 +342,85 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger
 			return nil, &Error{0, "Invalid request"}
 		}
 
-		if creds, err := extractSubsonicAuthBody(req); err != nil {
-			return nil, err
-		} else if creds != nil {
-			log.Debugf("Found credentials in POST body")
-			credentials = append(credentials, creds)
-		}
+		layers = append(layers, extractBodyCredentials(req)...)
 	}
 
 	for _, header := range basicAuthHeaders {
-		if creds, err := extractBasicAuth(req, header); err != nil {
-			return nil, err
-		} else if creds != nil {
-			log.Debugf("Found BasicAuth credentials in header: %s", header)
-			credentials = append(credentials, creds)
+		var found = len(req.Header[header]) > 0
+		var creds, err = extractBasicAuth(req, header)
+		layers = append(layers, layer{found: found, creds: creds, err: err, source: "header " + header})
+	}
+
+	return resolveCredentials(layers, allowApiKey, log)
+}
+
+// Picks the credentials to use among the layers, or the error to report.
+//
+// An API key must be the only credentials in the request, and the API key
+// extension requires error 43 otherwise, even if the other credentials are
+// invalid. This is why the errors of individual layers are only reported after
+// going through all layers.
+func resolveCredentials(layers []layer, allowApiKey bool, log logger) (*credentials, *Error) {
+	var keyFound, otherFound bool
+	var layerErr *Error
+	var credentials = make([]*credentials, 0)
+	for _, l := range layers {
+		if l.found && l.apiKey {
+			keyFound = true
+		} else if l.found {
+			otherFound = true
+		}
+
+		// Error messages are constant, so they don't leak credentials.
+		var kind = "credentials"
+		if l.apiKey {
+			kind = "API key"
+		}
+		switch {
+		case l.err != nil:
+			log.Debugf("Found invalid %s in %s: %s", kind, l.source, l.err.Message)
+			if layerErr == nil {
+				layerErr = l.err
+			}
+		case l.creds != nil:
+			log.Debugf("Found %s in %s", kind, l.source)
+			credentials = append(credentials, l.creds)
+		case l.found:
+			log.Debugf("Found empty %s in %s", kind, l.source)
 		}
 	}
 
-	if len(credentials) == 0 {
+	switch {
+	case keyFound && !allowApiKey:
+		return nil, &Error{42, "API key authentication not supported"}
+	case keyFound && otherFound:
+		return nil, &Error{43, "Multiple conflicting authentication mechanisms provided"}
+	case layerErr != nil:
+		return nil, layerErr
+	case len(credentials) == 0:
 		return nil, &Error{40, "Required parameters are missing: u, p"}
 	}
 
 	// OpenSubsonic has a dedicated error code for conflicting credentials (43),
-	// but it isn't part of the Subsonic spec, and the plugin can't tell whether
-	// the client supports OpenSubsonic. The generic error is used instead.
+	// but it isn't part of the Subsonic spec, and the plugin usually can't tell
+	// whether the client supports OpenSubsonic, so the generic error is used.
+	// When an API key is involved, the client supports OpenSubsonic, so the
+	// dedicated error code can be used.
 	var creds = credentials[0]
 	for _, c := range credentials[1:] {
-		if c.user != creds.user || c.pass != creds.pass {
-			return nil, &Error{0, "Multiple conflicting credentials provided"}
+		if c.user == creds.user && c.pass == creds.pass && c.apiKey == creds.apiKey {
+			continue
 		}
+		if keyFound {
+			return nil, &Error{43, "Multiple conflicting API keys provided"}
+		}
+		return nil, &Error{0, "Multiple conflicting credentials provided"}
 	}
 
 	return creds, nil
 }
 
-func extractSubsonicAuthQuery(r *http.Request, log logger) (*credentials, *Error) {
+func extractQueryCredentials(r *http.Request, log logger) ([]layer, *Error) {
 	var params url.Values
 	if p, err := url.ParseQuery(r.URL.RawQuery); err != nil {
 		log.Debugf("Error when parsing query: %s", err)
@@ -340,47 +429,66 @@ func extractSubsonicAuthQuery(r *http.Request, log logger) (*credentials, *Error
 		params = p
 	}
 
-	var creds *credentials
-	if c, err := handleSubsonicAuth(params); err != nil {
-		return nil, err
-	} else {
-		creds = c
-	}
-
-	params.Del("u")
-	params.Del("p")
-	params.Del("t")
-	params.Del("s")
+	var layers = extractParamCredentials(params, "query parameters")
 
 	r.URL.RawQuery = params.Encode()
 	r.RequestURI = r.URL.RequestURI()
 
-	return creds, nil
+	return layers, nil
 }
 
 // Assumes req.ParseForm() has already been called
-func extractSubsonicAuthBody(req *http.Request) (*credentials, *Error) {
-	var creds *credentials
-	if c, err := handleSubsonicAuth(req.PostForm); err != nil {
-		return nil, err
-	} else {
-		creds = c
-	}
-
+func extractBodyCredentials(req *http.Request) []layer {
 	var params = req.PostForm
-	params.Del("u")
-	params.Del("p")
-	params.Del("t")
-	params.Del("s")
+	var layers = extractParamCredentials(params, "POST body")
 
 	var body = params.Encode()
 	req.Body = io.NopCloser(strings.NewReader(body))
 	req.ContentLength = int64(len(body))
 
-	return creds, nil
+	return layers
 }
 
-func handleSubsonicAuth(params url.Values) (*credentials, *Error) {
+// Extracts and strips the API key, and the legacy credentials (username and
+// password, or token), from the parameters, as separate layers.
+func extractParamCredentials(params url.Values, source string) []layer {
+	var keyFound = len(params["apiKey"]) > 0
+	var legacyFound = len(params["u"]) > 0 || len(params["p"]) > 0 ||
+		len(params["t"]) > 0 || len(params["s"]) > 0
+
+	var keyCreds, keyErr = handleApiKeyAuth(params)
+	var legacyCreds, legacyErr = handleLegacyAuth(params)
+
+	params.Del("apiKey")
+	params.Del("u")
+	params.Del("p")
+	params.Del("t")
+	params.Del("s")
+
+	return []layer{
+		{found: keyFound, apiKey: true, creds: keyCreds, err: keyErr, source: source},
+		{found: legacyFound, creds: legacyCreds, err: legacyErr, source: source},
+	}
+}
+
+// Clients using the apiKey parameter support OpenSubsonic, so they can handle
+// the OpenSubsonic error codes.
+func handleApiKeyAuth(params url.Values) (*credentials, *Error) {
+	var keys = params["apiKey"]
+	switch {
+	case len(keys) == 0:
+		return nil, nil
+	case len(keys) > 1:
+		return nil, &Error{0, "Invalid request"}
+	// Keys that aren't valid bearer tokens can't be propagated
+	case !BEARER_TOKEN.MatchString(keys[0]):
+		return nil, &Error{44, "Invalid API key"}
+	default:
+		return &credentials{apiKey: keys[0]}, nil
+	}
+}
+
+func handleLegacyAuth(params url.Values) (*credentials, *Error) {
 	// Caution: url.Values.Get() returns the first parameter's value. We need to
 	// enforce that the query contains at most one of each auth parameter that
 	// we use for authentication, to avoid HTTP Parameter Pollution attacks. It
@@ -390,12 +498,6 @@ func handleSubsonicAuth(params url.Values) (*credentials, *Error) {
 
 	if len(params["t"]) > 0 || len(params["s"]) > 0 {
 		return nil, &Error{41, "Token authentication not supported"}
-	}
-
-	// Clients using the apiKey parameter support OpenSubsonic, so they can
-	// handle the OpenSubsonic error code.
-	if len(params["apiKey"]) > 0 {
-		return nil, &Error{42, "API key authentication not supported"}
 	}
 
 	var user string
@@ -421,7 +523,7 @@ func handleSubsonicAuth(params url.Values) (*credentials, *Error) {
 
 	switch {
 	case user != "" && pass != "":
-		return &credentials{user, pass}, nil
+		return &credentials{user: user, pass: pass}, nil
 	case user == "" && pass == "":
 		return nil, nil
 	case user == "":
@@ -440,12 +542,12 @@ func extractBasicAuth(r *http.Request, header string) (*credentials, *Error) {
 	case 1:
 		if u, p, ok := parseBasicAuth(h[0]); ok && u != "" && p != "" {
 			delete(r.Header, header)
-			return &credentials{u, p}, nil
+			return &credentials{user: u, pass: p}, nil
 		}
 
-		// Even if allowed by basicauth, it is assumed that subsonicauth doesn't
-		// allow empty username or password, so we shouldn't allow it for the
-		// basicauth adapter either.
+		// Even if allowed by basicauth, it is assumed that legacy authentication
+		// doesn't allow empty username or password, so we shouldn't allow it for
+		// the basicauth adapter either.
 		return nil, &Error{40, "Invalid BasicAuth credentials"}
 	case 0:
 		return nil, nil
@@ -479,6 +581,7 @@ type subsonicResponseWriter struct {
 	http.ResponseWriter
 	format      string
 	callback    string
+	authError   *Error // Sent in place of downstream authentication failures
 	intercepted bool
 	started     bool
 	log         logger
@@ -494,7 +597,7 @@ func (res *subsonicResponseWriter) WriteHeader(statusCode int) {
 
 	if !res.started && (statusCode == 401 || statusCode == 403 || statusCode == 407) {
 		res.log.Debugf("Rewriting authentication error response: %d", statusCode)
-		res.sendError(&Error{40, "Wrong username or password"})
+		res.sendError(res.authError)
 		return
 	}
 
