@@ -14,6 +14,10 @@ reduce the risk of exposing them in logs.
 The plugin validates Subsonic authentication parameters for security, and
 removes them before forwarding the request.
 
+It is designed for the Subsonic API first, but tries to play nice with
+OpenSubsonic: it supports several OpenSubsonic additions, either by default or
+as an option.
+
 # Security warning
 
 This plugin requires clients to use the old subsonic authentication scheme where
@@ -51,10 +55,6 @@ authors of actively maintained clients and servers. You are encouraged to stop
 using this plugin (and stop supporting the legacy Subsonic schemes altogether)
 once a consensus has been reached and clients and servers adopt the new scheme.
 
-
-[os-api-auth]: https://github.com/opensubsonic/open-subsonic-api/discussions/25
-[os-apikey]: https://opensubsonic.github.io/docs/extensions/apikeyauth/
-
 ## Traefik's access log
 
 Traefik's access log records credentials sent in the query string. It logs the
@@ -87,6 +87,30 @@ server might accept. The plugin rejects such credentials:
 
 The restrictions apply even when header propagation is disabled (see the
 `header` option).
+
+# OpenSubsonic's public extensions endpoint
+
+The OpenSubsonic spec requires the extensions endpoint
+(`getOpenSubsonicExtensions`) to be public, but by default this plugin requires
+credentials for it, as for every other endpoint (see the `anonymous` option).
+
+The endpoint can be used by OpenSubsonic clients to discover a server's
+capabilities instead of having to probe them. Its response includes
+authentication mechanisms, which in principle need to be discovered before
+authenticating. A client could then offer the user only the most secure
+mechanism that the server supports.
+
+But in practice, none of the clients we know of actually *need* the extensions
+endpoint to be public, and instead they let the user select the appropriate
+authentication mechanism, checking server capabilities with an authenticated
+request.
+
+The requirement for it to be public was added silently in October 2024, a year
+and a half after the endpoint itself, together with the API Key Authentication
+extension. It is this plugin's stance that making it a public endpoint was
+misguided and unnecessary, and that together with mixing in authentication and
+other server capabilities it's making the life of everyone in the security
+stack more difficult.
 
 # Configuration
 
@@ -187,6 +211,73 @@ an invalid API key.
 > which this plugin doesn't modify. If your Subsonic server doesn't support API
 > keys but your authentication service does, you have to rewrite that response
 > yourself to add the extension.
+>
+> Clients that query that endpoint before the user has logged in may need the
+> `anonymous` option.
+
+**`anonymous`**
+
+Optional, either `reject` (the default) or `forward`.
+
+Specifies how requests without credentials are handled:
+
+* `reject`: requests without credentials are rejected with error 40. The
+  Subsonic API has no public endpoints.
+* `forward`: requests without credentials are forwarded without the header (see
+  the `header` option). Your authentication service, or your Subsonic server in
+  backend authentication mode, decides which endpoints are public and rejects
+  requests to the others.
+
+The `forward` mode is meant for endpoints that OpenSubsonic requires to be
+public, such as the extensions endpoint (`getOpenSubsonicExtensions`), which
+clients can query before the user has logged in.
+
+> [!TIP]
+>
+> You should leave this option at its default, `reject`, unless one of your
+> clients needs the extensions endpoint to be public. With `reject`, a client
+> that queries the endpoint before logging in gets error 40, and may conclude
+> that the server has no extensions or does not support OpenSubsonic.
+>
+> See [OpenSubsonic's public extensions
+> endpoint](#opensubsonics-public-extensions-endpoint) for why this plugin
+> doesn't follow the spec by default.
+
+A request has no credentials only if none of the parameters and headers that the
+plugin reads credentials from is present, even with an empty value: no `u`, `p`,
+`t`, `s` or `apiKey` parameter in the query or the POST body, and none of the
+headers in `client-headers`. Requests with empty, incomplete or invalid
+credentials are still rejected.
+
+In proxy authentication mode, your authentication service must:
+
+* let requests to the public endpoints through. Traefik's BasicAuth middleware
+  can't exempt paths, so it can't be used with the `forward` mode.
+* answer requests to the other endpoints with status 401, 403 or 407, which the
+  plugin rewrites into a Subsonic error. Many single sign-on services redirect
+  requests without credentials to their login page instead, which Subsonic
+  clients can't handle and this plugin can't reliably rewrite.
+
+> [!CAUTION]
+>
+> With `forward`, make sure that nothing downstream authenticates a request
+> without Subsonic credentials through credentials that browsers send on their
+> own, such as the session cookie of a single sign-on service.
+>
+> Otherwise, other websites can make the browser of a logged-in user send
+> Subsonic API requests as that user (CSRF). The Subsonic API changes data with
+> GET requests, so following a link can be enough. With JSONP responses
+> (`f=jsonp`), pages on your other subdomains, or any website if the cookie is
+> `SameSite=None`, can also read the responses.
+>
+> In `reject` mode, every request carries the header with Subsonic credentials,
+> which other websites don't know. With `forward`, when the header is missing,
+> authentication services commonly fall back to the cookie.
+>
+> You can for example remove the `Cookie` header with a Headers middleware (an
+> empty value in `customRequestHeaders` removes the header), or, in proxy
+> authentication mode, list only the headers your authentication service needs
+> in the ForwardAuth middleware's `authRequestHeaders` option.
 
 ## Debug logs
 
@@ -241,3 +332,7 @@ labels:
     traefik.http.routers.subsonic.rule: Host(`subsonic.example.com`) && PathPrefix(`/rest/`)
     traefik.http.routers.subsonic.middlewares: authservice-subsonicauth@docker
 ```
+
+
+[os-api-auth]: https://github.com/opensubsonic/open-subsonic-api/discussions/25
+[os-apikey]: https://opensubsonic.github.io/docs/extensions/apikeyauth/

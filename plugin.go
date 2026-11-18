@@ -104,6 +104,23 @@ type Config struct {
 	// modify. If the backend doesn't support API keys, that response has to be
 	// rewritten.
 	ApiKey string `json:"apikey"`
+
+	// Handling of requests without credentials, i.e. without any of the
+	// parameters and headers that can carry them, even with an empty value.
+	//
+	// * "reject" (default): Requests without credentials are rejected. The
+	//   Subsonic API has no public endpoints.
+	//
+	// * "forward": Requests without credentials are forwarded without the
+	//   propagated header, and the authentication service (or the backend in
+	//   backend mode) decides which endpoints are public, e.g. OpenSubsonic's
+	//   `getOpenSubsonicExtensions`.
+	//
+	//   SECURITY NOTE: Nothing downstream may authenticate these requests
+	//   through credentials that browsers send on their own, such as a session
+	//   cookie. Otherwise the Subsonic API, which changes data with GET
+	//   requests, becomes vulnerable to CSRF.
+	Anonymous string `json:"anonymous"`
 }
 
 func CreateConfig() *Config {
@@ -111,6 +128,7 @@ func CreateConfig() *Config {
 		Header:        "Authorization",
 		ClientHeaders: "Authorization",
 		ApiKey:        "reject",
+		Anonymous:     "reject",
 	}
 }
 
@@ -153,6 +171,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	case "reject", "bearer":
 	default:
 		return nil, configError("invalid 'apikey' parameter: %s", config.ApiKey)
+	}
+
+	switch config.Anonymous {
+	case "reject", "forward":
+	default:
+		return nil, configError("invalid 'anonymous' parameter: %s", config.Anonymous)
 	}
 
 	var mw = &Middleware{
@@ -244,8 +268,9 @@ func (mw *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 
 func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 	var propagateHeader = mw.config.Header != ""
-	var interceptResponse = mw.config.Header != "" && mw.config.Auth == "proxy"
+	var interceptResponse = propagateHeader && mw.config.Auth == "proxy"
 	var allowApiKey = mw.config.ApiKey == "bearer"
+	var allowAnonymous = mw.config.Anonymous == "forward"
 
 	var layers, extractErr = extractCredentials(req, mw.clientHeaders, mw.log)
 	if extractErr != nil {
@@ -253,35 +278,50 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 		return
 	}
 
-	var creds, resolveErr = resolveCredentials(layers, allowApiKey, mw.log)
+	var creds, resolveErr = resolveCredentials(layers, allowApiKey, allowAnonymous, mw.log)
 	if resolveErr != nil {
 		res.sendError(resolveErr)
 		return
 	}
 
-	// The header value is built even if it isn't propagated, so that the same
-	// credentials are rejected in every mode.
-	var headerValue, encodeErr = creds.HeaderValue()
-	if encodeErr != nil {
-		// Error messages are constant, so they don't leak credentials.
-		mw.log.Debugf("Credentials can't be encoded in a header: %s", encodeErr.Message)
-		res.sendError(encodeErr)
-		return
-	}
+	if creds == nil {
+		mw.log.Debugf("Forwarding anonymous request")
 
-	if propagateHeader {
-		if creds.apiKey != "" {
-			mw.log.Debugf("Propagating header for API key")
-		} else {
-			mw.log.Debugf("Propagating header for user: %q", creds.user)
+		// The header is deleted rather than just not set: unless it is one of
+		// the client headers, which are already stripped, the client could have
+		// sent it itself.
+		if propagateHeader {
+			req.Header.Del(mw.config.Header)
 		}
-		req.Header.Set(mw.config.Header, headerValue)
+	} else {
+		// The header value is built even if it isn't propagated, so that the
+		// same credentials are rejected in every mode.
+		var headerValue, encodeErr = creds.HeaderValue()
+		if encodeErr != nil {
+			// Error messages are constant, so they don't leak credentials.
+			mw.log.Debugf("Credentials can't be encoded in a header: %s", encodeErr.Message)
+			res.sendError(encodeErr)
+			return
+		}
+
+		if propagateHeader {
+			if creds.apiKey != "" {
+				mw.log.Debugf("Propagating header for API key")
+			} else {
+				mw.log.Debugf("Propagating header for user: %q", creds.user)
+			}
+			req.Header.Set(mw.config.Header, headerValue)
+		}
 	}
 
 	if interceptResponse {
-		res.authError = &Error{40, "Wrong username or password"}
-		if creds.apiKey != "" {
+		switch {
+		case creds == nil:
+			res.authError = &Error{40, "Required parameters are missing: u, p"}
+		case creds.apiKey != "":
 			res.authError = &Error{44, "Invalid API key"}
+		default:
+			res.authError = &Error{40, "Wrong username or password"}
 		}
 		mw.next.ServeHTTP(&res, req)
 	} else {
@@ -405,11 +445,14 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger
 
 // Picks the credentials to use among the layers, or the error to report.
 //
+// If anonymous requests are allowed, returns neither credentials nor an error
+// for a request without credentials.
+//
 // An API key must be the only credentials in the request, and the API key
 // extension requires error 43 otherwise, even if the other credentials are
 // invalid. This is why the errors of individual layers are only reported after
 // going through all layers.
-func resolveCredentials(layers []layer, allowApiKey bool, log logger) (*credentials, *Error) {
+func resolveCredentials(layers []layer, allowApiKey, allowAnonymous bool, log logger) (*credentials, *Error) {
 	var keyFound, otherFound bool
 	var layerErr *Error
 	var credentials = make([]*credentials, 0)
@@ -446,6 +489,10 @@ func resolveCredentials(layers []layer, allowApiKey bool, log logger) (*credenti
 		return nil, &Error{43, "Multiple conflicting authentication mechanisms provided"}
 	case layerErr != nil:
 		return nil, layerErr
+	case !keyFound && !otherFound && allowAnonymous:
+		// Empty credentials (e.g. `u=&p=`) are found, so they are rejected by
+		// the next rule.
+		return nil, nil
 	case len(credentials) == 0:
 		return nil, &Error{40, "Required parameters are missing: u, p"}
 	}
