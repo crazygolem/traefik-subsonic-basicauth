@@ -99,6 +99,10 @@ type Config struct {
 	//
 	// * "bearer": The key is propagated as a Bearer token.
 	//
+	// * "passthrough": The key is forwarded to the backend as the `apiKey`
+	//   parameter, in the POST body if the request has a form body, and in the
+	//   query otherwise. Only allowed in backend authentication mode.
+	//
 	// Clients are expected to look for the `apiKeyAuthentication` extension in
 	// the `getOpenSubsonicExtensions` response, which the plugin doesn't
 	// modify. If the backend doesn't support API keys, that response has to be
@@ -169,6 +173,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 	switch config.ApiKey {
 	case "reject", "bearer":
+	case "passthrough":
+		if config.Auth != "backend" {
+			return nil, configError("invalid 'apikey' parameter: passthrough requires 'auth: backend'")
+		}
 	default:
 		return nil, configError("invalid 'apikey' parameter: %s", config.ApiKey)
 	}
@@ -269,10 +277,11 @@ func (mw *Middleware) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 	var propagateHeader = mw.config.Header != ""
 	var interceptResponse = propagateHeader && mw.config.Auth == "proxy"
-	var allowApiKey = mw.config.ApiKey == "bearer"
+	var allowApiKey = mw.config.ApiKey != "reject"
+	var passthroughApiKey = mw.config.ApiKey == "passthrough"
 	var allowAnonymous = mw.config.Anonymous == "forward"
 
-	var layers, extractErr = extractCredentials(req, mw.clientHeaders, mw.log)
+	var layers, formBody, extractErr = extractCredentials(req, mw.clientHeaders, mw.log)
 	if extractErr != nil {
 		res.sendError(extractErr)
 		return
@@ -284,33 +293,55 @@ func (mw *Middleware) serveHTTP(res subsonicResponseWriter, req *http.Request) {
 		return
 	}
 
-	if creds == nil {
+	// Left empty when the credentials aren't propagated in the header.
+	var headerValue string
+	switch {
+	case creds == nil:
 		mw.log.Debugf("Forwarding anonymous request")
-
-		// The header is deleted rather than just not set: unless it is one of
-		// the client headers, which are already stripped, the client could have
-		// sent it itself.
-		if propagateHeader {
-			req.Header.Del(mw.config.Header)
-		}
-	} else {
+	case passthroughApiKey && creds.apiKey != "":
+		// The key isn't put in a header, so HeaderValue's restrictions don't
+		// apply to it.
+	default:
 		// The header value is built even if it isn't propagated, so that the
 		// same credentials are rejected in every mode.
-		var headerValue, encodeErr = creds.HeaderValue()
+		var encodeErr *Error
+		headerValue, encodeErr = creds.HeaderValue()
 		if encodeErr != nil {
 			// Error messages are constant, so they don't leak credentials.
 			mw.log.Debugf("Credentials can't be encoded in a header: %s", encodeErr.Message)
 			res.sendError(encodeErr)
 			return
 		}
+	}
 
-		if propagateHeader {
-			if creds.apiKey != "" {
-				mw.log.Debugf("Propagating header for API key")
-			} else {
-				mw.log.Debugf("Propagating header for user: %q", creds.user)
-			}
+	if propagateHeader {
+		switch {
+		case headerValue == "":
+			// The header is deleted rather than just not set: unless it is one
+			// of the client headers, which are already stripped, the client
+			// could have sent it itself.
+			req.Header.Del(mw.config.Header)
+		case creds.apiKey != "":
+			mw.log.Debugf("Propagating header for API key")
 			req.Header.Set(mw.config.Header, headerValue)
+		default:
+			mw.log.Debugf("Propagating header for user: %q", creds.user)
+			req.Header.Set(mw.config.Header, headerValue)
+		}
+	}
+
+	// The key is put back into the request, which extractCredentials stripped
+	// it from, so that the backend gets exactly one copy.
+	if creds != nil && passthroughApiKey && creds.apiKey != "" {
+		if formBody {
+			req.PostForm.Set("apiKey", creds.apiKey)
+			setBody(req, req.PostForm)
+			mw.log.Debugf("Forwarding API key in POST body")
+		} else {
+			var query = req.URL.Query()
+			query.Set("apiKey", creds.apiKey)
+			setQuery(req, query)
+			mw.log.Debugf("Forwarding API key in query parameters")
 		}
 	}
 
@@ -373,21 +404,23 @@ type layer struct {
 }
 
 // Extracts and strips credentials from every part of the request that can
-// carry them, as layers to be resolved by resolveCredentials. Only returns an
-// error if the request itself is invalid.
+// carry them, as layers to be resolved by resolveCredentials. Also returns
+// whether the request has a form body, possibly empty, i.e. whether the
+// parameters in req.PostForm are forwarded. Only returns an error if the
+// request itself is invalid.
 //
 // The header names must be in canonical form (see parseHeaderList).
-func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger) ([]layer, *Error) {
+func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger) ([]layer, bool, *Error) {
 	var layers = make([]layer, 0)
+	var formBody = false
 
 	var query, err = url.ParseQuery(req.URL.RawQuery)
 	if err != nil {
 		log.Debugf("Error when parsing query: %s", err)
-		return nil, &Error{0, "Invalid request"}
+		return nil, false, &Error{0, "Invalid request"}
 	}
 	layers = append(layers, extractCredentialsFromParams(query, "query parameters")...)
-	req.URL.RawQuery = query.Encode()
-	req.RequestURI = req.URL.RequestURI()
+	setQuery(req, query)
 
 	// Some subsonic clients apparently use POST with form data to transmit
 	// parameters instead of, or in addition to placing them in the query.
@@ -408,25 +441,30 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger
 	//
 	// This plugin requires the header.
 	//
-	// As an exception, POST requests without a body are accepted whatever their
-	// content type, as they cannot carry parameters (some clients could send
-	// POST requests without a body, and the parameters still in the query). For
-	// incoming requests, a ContentLength of 0 means that the body is known to
-	// be empty, whereas a body of unknown length (e.g. chunked) has a
-	// ContentLength of -1 and is still checked.
+	// As an exception, POST requests without a body are accepted with any other
+	// content type, or none, as they cannot carry parameters (some clients
+	// could send POST requests without a body, and the parameters still in the
+	// query). For incoming requests, a ContentLength of 0 means that the body
+	// is known to be empty, whereas a body of unknown length (e.g. chunked) has
+	// a ContentLength of -1 and is still rejected.
 	//
 	// [1]: https://opensubsonic.github.io/docs/extensions/formpost/
-	if req.Method == "POST" && req.ContentLength != 0 {
+	if req.Method == "POST" {
 		var ct, _, err = mime.ParseMediaType(req.Header.Get("Content-Type"))
-		if err != nil || ct != "application/x-www-form-urlencoded" {
-			return nil, &Error{0, "Invalid request"}
-		}
+		var formPost = err == nil && ct == "application/x-www-form-urlencoded"
 
-		// req.PostForm was filled by req.ParseForm(), in ServeHTTP.
-		layers = append(layers, extractCredentialsFromParams(req.PostForm, "POST body")...)
-		var body = req.PostForm.Encode()
-		req.Body = io.NopCloser(strings.NewReader(body))
-		req.ContentLength = int64(len(body))
+		switch {
+		case !formPost && req.ContentLength != 0:
+			return nil, false, &Error{0, "Invalid request"}
+		case !formPost:
+			// The exception: a body known to be empty carries no parameters, so
+			// it is forwarded as is, with its content type.
+		default:
+			// req.PostForm was filled by req.ParseForm(), in ServeHTTP.
+			layers = append(layers, extractCredentialsFromParams(req.PostForm, "POST body")...)
+			setBody(req, req.PostForm)
+			formBody = true
+		}
 	}
 
 	// req.Form is a separate map, built by req.ParseForm() from the query and
@@ -440,7 +478,20 @@ func extractCredentials(req *http.Request, basicAuthHeaders []string, log logger
 		layers = append(layers, extractCredentialsFromHeader(req.Header, name))
 	}
 
-	return layers, nil
+	return layers, formBody, nil
+}
+
+// Replaces the query of the request with the parameters, encoded.
+func setQuery(req *http.Request, query url.Values) {
+	req.URL.RawQuery = query.Encode()
+	req.RequestURI = req.URL.RequestURI()
+}
+
+// Replaces the body of the request with the parameters, form-encoded.
+func setBody(req *http.Request, form url.Values) {
+	var body = form.Encode()
+	req.Body = io.NopCloser(strings.NewReader(body))
+	req.ContentLength = int64(len(body))
 }
 
 // Picks the credentials to use among the layers, or the error to report.

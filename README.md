@@ -82,8 +82,9 @@ server might accept. The plugin rejects such credentials:
   Passwords can contain colons.
 * **API keys must be valid Bearer tokens**: letters, digits and `-._~+/`,
   optionally followed by `=` padding. Requests with any other key fail with
-  error 44. This only applies with `apikey: bearer`, since otherwise every API
-  key is rejected (see the `apikey` option).
+  error 44. This only applies with `apikey: bearer`: with `passthrough` the key
+  isn't put in the header, and with `reject` every API key is rejected (see the
+  `apikey` option).
 
 The restrictions apply even when header propagation is disabled (see the
 `header` option).
@@ -153,7 +154,8 @@ Specifies the header that gets propagated with the Basic credentials, or the
 Bearer token (see the `apikey` option). The header name is case-insensitive,
 and an invalid name makes the configuration fail to load. An empty value
 disables header propagation and response rewriting. The Subsonic authentication
-parameters still get validated and removed from the forwarded request.
+parameters still get validated and removed from the forwarded request, except
+for API keys with `apikey: passthrough`.
 
 If you log request headers in Traefik's access log, drop or redact this header:
 Traefik reads them after the plugin has set them.
@@ -184,7 +186,7 @@ unless you remove them using another middleware.
 
 **`apikey`**
 
-Optional, either `reject` (the default) or `bearer`.
+Optional, one of `reject` (the default), `bearer` or `passthrough`.
 
 Specifies how the `apiKey` parameter from the [API key extension][os-apikey] is
 handled:
@@ -194,15 +196,34 @@ handled:
   <key>` with the default `header`). Your authentication service, or your
   Subsonic server in backend authentication mode, must accept the key as a
   Bearer token.
+* `passthrough`: the key is forwarded to your Subsonic server in the `apiKey`
+  parameter. Only allowed in backend authentication mode; meant for Subsonic
+  servers that support the API key extension.
 
 Clients must send the key in the `apiKey` parameter (query or POST body), as
-the API key extension specifies. Bearer tokens sent by clients in headers are
-not treated as API keys.
+the API key extension specifies, and without any other credentials. Bearer
+tokens sent by clients in headers are not treated as API keys.
 
-The key must be sent without any other credentials, and must be a valid Bearer
-token (see [Restrictions on Subsonic credentials](#restrictions-on-subsonic-credentials)).
-In proxy authentication mode, authentication failures are reported to clients as
-an invalid API key.
+With `bearer`, the key must be a valid Bearer token (see [Restrictions on
+Subsonic credentials](#restrictions-on-subsonic-credentials)). In proxy
+authentication mode, authentication failures are reported to clients as an
+invalid API key.
+
+With `passthrough`, your Subsonic server gets a single copy of the key, even if
+the client sent it in both the query and the POST body. The key goes:
+
+* in the POST body if the request is a POST with the
+  `application/x-www-form-urlencoded` content type, even if the body is empty or
+  the client sent the key in the query.
+* in the query otherwise. The request's method and content type aren't changed,
+  so **the key can appear in downstream logs**.
+
+The `passthrough` mode isn't allowed in proxy authentication mode, because the
+authentication service would get no credentials in the header and is not
+expected to look for the `apiKey` parameter. It could reject every request with
+an API key, or worse, authenticate it through something else, such as the
+session cookie of a single sign-on service (see the caution about CSRF under the
+`anonymous` option).
 
 > [!IMPORTANT]
 >
